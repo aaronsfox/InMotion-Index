@@ -26,12 +26,20 @@ import matplotlib.patches as patches
 import matplotlib.animation as animation
 from matplotlib import font_manager
 from matplotlib.collections import LineCollection
+from matplotlib.patches import Circle, RegularPolygon
+from matplotlib.path import Path
+from matplotlib.projections.polar import PolarAxes
+from matplotlib.projections import register_projection
+from matplotlib.spines import Spine
+from matplotlib.transforms import Affine2D
 import nfl_data_py as nfl
 import math
 import os
 from PIL import Image, ImageChops, ImageDraw
 import requests
 from tqdm import tqdm
+from scipy import stats
+
 
 #Add custom fonts for use with matplotlib
 fontDir = [os.getcwd()+os.sep+os.path.join('..','fonts')]
@@ -567,6 +575,124 @@ def cropPlayerImg(imgList, outputFolder):
                 im.save(os.path.splitext(imgFile)[0] + f'_cropped_col{colList.index(col)}' + os.path.splitext(imgFile)[-1])
 
 # =========================================================================
+# Function to calculate IMI
+# =========================================================================
+
+def calcIMI(calcImiData, weightsIMI, nSamples, seed):
+
+    # Create dictionary to store data in
+    imiResults = {}
+
+    # Set boolean and continuous variables
+    boolVars = ['targeted', 'reception', 'createdSpace', 'createdSpaceEarly']
+    contVars = ['yards', 'yac', 'peakSeparation', 'separationAtCatch', 'releaseSpeed']
+
+    # Loop through variables to calculate individual IMI components
+    # -------------------------------------------------------------------------
+    for imiVar in calcImiData.keys():
+
+        # Create key in results dictionary
+        imiResults[imiVar] = {}
+
+        # Check for boolean vs. continuous value
+        # Boolean variable sampling
+        if imiVar in boolVars:
+
+            # Sample values from beta distribution for variable
+            # Set seed prior to sampling for consistency
+            # Use a try statement to avoid errors when there is a zero count for something
+            # When this occurs set all sample values to 0 or 1
+            np.random.seed(seed+list(calcImiData.keys()).index(imiVar)+123)
+            try:
+                samplesStationary = np.random.beta(calcImiData[imiVar]['stationaryTrue'],
+                                                   calcImiData[imiVar]['stationaryFalse'],
+                                                   size=nSamples)
+            except:
+                if calcImiData[imiVar]['stationaryTrue'] == 0:
+                    samplesStationary = np.zeros(nSamples)
+                elif calcImiData[imiVar]['stationaryFalse'] == 0:
+                    samplesStationary = np.zeros(nSamples) + 1.0
+            np.random.seed(seed+list(calcImiData.keys()).index(imiVar)+321)
+            try:
+                samplesInMotion = np.random.beta(calcImiData[imiVar]['inMotionTrue'],
+                                                 calcImiData[imiVar]['inMotionFalse'],
+                                                 size=nSamples)
+            except:
+                if calcImiData[imiVar]['inMotionTrue'] == 0:
+                    samplesInMotion = np.zeros(nSamples)
+                elif calcImiData[imiVar]['inMotionFalse'] == 0:
+                    samplesInMotion = np.zeros(nSamples) + 1.0
+
+        # Continuous variable sampling
+        elif imiVar in contVars:
+
+            # Sample values from truncated normal distribution for variable
+            # For continuous values these are truncated to always be positive and no further than 1SD above the mean
+            # Standard deviation can sometimes be 0, so sample all values as the mean in these cases
+            # Set seed for sampling to ensure consistency
+            try:
+                samplesStationary = stats.truncnorm(
+                    1e-5, calcImiData[imiVar]['stationaryMu'] + calcImiData[imiVar]['stationarySigma'],
+                    loc = calcImiData[imiVar]['stationaryMu'], scale = calcImiData[imiVar]['stationarySigma']
+                ).rvs(nSamples, random_state = seed+list(calcImiData.keys()).index(imiVar)+987)
+            except:
+                samplesStationary = np.zeros(nSamples) + calcImiData[imiVar]['stationaryMu']
+            try:
+                samplesInMotion = stats.truncnorm(
+                    1e-5, calcImiData[imiVar]['inMotionMu'] + calcImiData[imiVar]['inMotionSigma'],
+                    loc=calcImiData[imiVar]['inMotionMu'], scale=calcImiData[imiVar]['inMotionSigma']
+                ).rvs(nSamples, random_state=seed + list(calcImiData.keys()).index(imiVar) + 789)
+            except:
+                samplesInMotion = np.zeros(nSamples) + calcImiData[imiVar]['inMotionMu']
+
+        # Error if variable not in boolean or continuous list
+        else:
+            raise ValueError('Variable not in those listed as boolean or continuous for IMI calculations...')
+
+        # Get relative odds from samples
+        sampleRatios = samplesInMotion / samplesStationary
+
+        # Create values for empirical cumulative distribution function
+        cdfX = np.sort(sampleRatios)
+        cdfY = np.arange(1, nSamples + 1) / nSamples
+
+        # Calculate HSI values for metric
+        mean = sampleRatios.mean()
+        lower = cdfX[int(np.where(cdfY == 0.05)[0].mean())]
+        upper = cdfX[int(np.where(cdfY == 0.95)[0].mean())]
+
+        # Store values in dictionary
+        imiResults[imiVar]['mean'] = mean
+        imiResults[imiVar]['lowerBound'] = lower
+        imiResults[imiVar]['upperBound'] = upper
+        imiResults[imiVar]['sampleRatios'] = sampleRatios
+
+    # Calculate overall IMI value
+    # -------------------------------------------------------------------------
+
+    # Create space to store overall IMI calculations
+    imiSampleVals = np.zeros(nSamples)
+
+    # Get calculation weights for IMI variables
+    imiWeights = np.array([weightsIMI[imiVar] for imiVar in imiResults.keys()])
+
+    # Calculate weighted mean across sample ratios to get sample IMI values
+    for ii in range(nSamples):
+        # Get sample values for current sampling iteration
+        sampleVals = np.array([imiResults[imiVar]['sampleRatios'][ii] for imiVar in imiResults.keys()])
+        # Calculate the weighted mean for the sample IMI and store in array
+        imiSampleVals[ii] = np.average(sampleVals, weights = imiWeights)
+
+    # Store IMI calculations in dictionary
+    imiResults['IMI'] = {'sampleVals': imiSampleVals}
+
+    # Return IMI results
+    # -------------------------------------------------------------------------
+
+    # Return dictionary from function
+    return imiResults
+
+# =========================================================================
 # Function to sample and calculate relative ratios from count data
 # =========================================================================
 
@@ -648,5 +774,105 @@ def relRatiosFromContinuous(A, B, seed, nSamples):
 
     # Return values
     return mean, lower, upper
+
+# =========================================================================
+# Function for plotting radar spider charts
+# =========================================================================
+def radar_factory(num_vars, frame='circle'):
+    """Create a radar chart with `num_vars` axes.
+
+    This function creates a RadarAxes projection and registers it.
+
+    Parameters
+    ----------
+    num_vars : int
+        Number of variables for radar chart.
+    frame : {'circle' | 'polygon'}
+        Shape of frame surrounding axes.
+
+    """
+    # calculate evenly-spaced axis angles
+    theta = np.linspace(0, 2 * np.pi, num_vars, endpoint=False)
+
+    class RadarTransform(PolarAxes.PolarTransform):
+        def transform_path_non_affine(self, path):
+            # Paths with non-unit interpolation steps correspond to gridlines,
+            # in which case we force interpolation (to defeat PolarTransform's
+            # autoconversion to circular arcs).
+            if path._interpolation_steps > 1:
+                path = path.interpolated(num_vars)
+            return Path(self.transform(path.vertices), path.codes)
+
+    class RadarAxes(PolarAxes):
+
+        name = 'radar'
+
+        PolarTransform = RadarTransform
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # rotate plot such that the first axis is at the top
+            self.set_theta_zero_location('N')
+
+        def fill(self, *args, closed=True, **kwargs):
+            """Override fill so that line is closed by default"""
+            return super().fill(closed=closed, *args, **kwargs)
+
+        def plot(self, *args, **kwargs):
+            """Override plot so that line is closed by default"""
+            lines = super().plot(*args, **kwargs)
+            for line in lines:
+                self._close_line(line)
+
+        def _close_line(self, line):
+            x, y = line.get_data()
+            # FIXME: markers at x[0], y[0] get doubled-up
+            if x[0] != x[-1]:
+                x = np.concatenate((x, [x[0]]))
+                y = np.concatenate((y, [y[0]]))
+                line.set_data(x, y)
+
+        def set_varlabels(self, labels):
+            self.set_thetagrids(np.degrees(theta), labels)
+
+        def _gen_axes_patch(self):
+            # The Axes patch must be centered at (0.5, 0.5) and of radius 0.5
+            # in axes coordinates.
+            if frame == 'circle':
+                return Circle((0.5, 0.5), 0.5)
+            elif frame == 'polygon':
+                return RegularPolygon((0.5, 0.5), num_vars,
+                                      radius=.5, edgecolor="k")
+            else:
+                raise ValueError("unknown value for 'frame': %s" % frame)
+
+        def draw(self, renderer):
+            """ Draw. If frame is polygon, make gridlines polygon-shaped """
+            if frame == 'polygon':
+                gridlines = self.yaxis.get_gridlines()
+                for gl in gridlines:
+                    gl.get_path()._interpolation_steps = num_vars
+            super().draw(renderer)
+
+        def _gen_axes_spines(self):
+            if frame == 'circle':
+                return super()._gen_axes_spines()
+            elif frame == 'polygon':
+                # spine_type must be 'left'/'right'/'top'/'bottom'/'circle'.
+                spine = Spine(axes=self,
+                              spine_type='circle',
+                              path=Path.unit_regular_polygon(num_vars))
+                # unit_regular_polygon gives a polygon of radius 1 centered at
+                # (0, 0) but we want a polygon of radius 0.5 centered at (0.5,
+                # 0.5) in axes coordinates.
+                spine.set_transform(Affine2D().scale(.5).translate(.5, .5)
+                                    + self.transAxes)
+
+                return {'polar': spine}
+            else:
+                raise ValueError("unknown value for 'frame': %s" % frame)
+
+    register_projection(RadarAxes)
+    return theta
 
 # %% ---------- end of helperFuncs.py ---------- %% #

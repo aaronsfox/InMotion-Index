@@ -9,29 +9,10 @@
     aaron.f@deakin.edu.au
 
     Python script for Big Data Bowl 2025 entry calculating In Motion Index.
-    This script uses the associated helperFuncs.py script for visualisations.
+    This script uses the associated helperFuncs.py script for calculations and
+    visualisations.
 
     Run on python version 3.10.14
-
-    TODO:
-        > Weights for overall in motion index
-        > Only include pass plays in dataset
-        > Correlate player and team in-motion route rate to offensive pass success metrics?
-            >> Doesn't really demonstrate use of in motion index though?
-        > Find players with similar HSI but different profiles via correlation - demonstrate altered player profile?
-        > New metrics - more boolean style metrics?
-            >> Catch rate doesn't work that well
-            >> Quick separation - getting 'open' by distance threshold distance in < avg. time to throw?
-            >> Leverage on man?
-
-
-    NOTES:
-        > Purpose statements - how does receiving performance of plauyers and teams change when in-motion at the snap, which players increase their performance
-                               the most when in-motion and should therefore be a focus when in-motion
-
-    LIMITATIONS:
-        > Non-contextual (e.g. in-motion more at goal line or further away?)
-
 
 """
 
@@ -49,6 +30,7 @@ import matplotlib.patches as patches
 import matplotlib.animation as animation
 from matplotlib import font_manager
 from matplotlib.collections import LineCollection
+from matplotlib import lines
 from matplotlib.offsetbox import (AnnotationBbox, DrawingArea, OffsetImage, TextArea)
 import nfl_data_py as nfl
 import math
@@ -58,12 +40,11 @@ import os
 from glob import glob
 from tqdm import tqdm
 import pickle
-from scipy import stats
 import random
 from itertools import groupby
 
 # Import helper functions
-from helperFuncs import createField, drawFrame, downloadTeamImages, downloadPlayerImages, cropPlayerImg, relRatiosFromCounts, relRatiosFromContinuous
+from helperFuncs import createField, drawFrame, downloadTeamImages, downloadPlayerImages, cropPlayerImg, calcIMI, radar_factory
 
 # =========================================================================
 # Set-up
@@ -71,15 +52,25 @@ from helperFuncs import createField, drawFrame, downloadTeamImages, downloadPlay
 
 # Set a boolean value to re-analyse data or simply load from dictionary
 # Default is False --- swap to True if wishing to re-run analysis
-calcHeadStartIndex = True
+calcInMotionIndex = False
 
 # Set a boolean value to reproduce visuals
-# Default is False --- swap to True if wishing to re-run analysis
-createVisuals = True
+# Default is False --- swap to True if wishing to re-create visuals
+createVisuals = False
+
+# Set a boolean value to summarise data
+# Default is False --- swap to True if wishing to review summary data
+summariseData = False
+
+# Set weights for IMI components
+weightsIMI = {'targeted': 0.20, 'reception': 0.20, # 'catchRate': 0.0,
+              'yards': 0.20, 'yac': 0.15,
+              'peakSeparation': 0.05, 'separationAtCatch': 0.10,
+              'releaseSpeed': 0.10
+              }
 
 # Set matplotlib parameters
 from matplotlib import rcParams
-# rcParams['font.family'] = 'sans-serif'
 rcParams['font.sans-serif'] = 'Arial'
 rcParams['font.weight'] = 'bold'
 rcParams['axes.labelsize'] = 12
@@ -161,11 +152,11 @@ for fName in tqdm(trackingFiles):
 # =========================================================================
 
 # Check for calculating
-if calcHeadStartIndex:
+if calcInMotionIndex:
 
     # Set the minimum number of routes run to be included in the dataset
     # Note this is relatively arbitrary and could be changed to check different players
-    minRoutes = 50
+    minRoutes = 100
 
     # Set the list of route runners to collect
     routeRunners = []
@@ -183,7 +174,8 @@ if calcHeadStartIndex:
                      'stationRoutePlays': [], 'nStationRoutes': []}
 
     # Loop through players
-    for nflId in routeRunners:
+    print('Extracting route data for route runners...')
+    for nflId in tqdm(routeRunners):
 
         # Extract plays for current player
         playerPlays = player_play.loc[player_play['nflId'] == nflId]
@@ -202,8 +194,12 @@ if calcHeadStartIndex:
                 playerPlays['inMotionAtBallSnap'], playerPlays['wasRunningRoute']):
 
             # Check for passing play as we only want to include these
-            # Do this by looking for pass result indicators
-            if plays.loc[(plays['gameId'] == gameId) & (plays['playId'] == playId)]['passResult'].values[0] in ['C','I','S','IN','R']:
+            # Do this by looking for pass event indicators in tracking data
+            weekNo = games.loc[(games['gameId'] == gameId)]['week'].values[0]
+            playEvents = tracking[f'week{weekNo}'].loc[
+                (tracking[f'week{weekNo}']['gameId'] == gameId) &
+                (tracking[f'week{weekNo}']['playId'] == playId)]['event'].unique().tolist()
+            if any([str(eventName).startswith('pass_') for eventName in playEvents]):
 
                 # Check for motion and route
                 # Annoyingly these are in different formats (boolean vs. int)
@@ -325,7 +321,7 @@ if createVisuals:
 
     #Add descriptive text
     fig.text(0.01, 0.94,
-             'Players required minimum of 50 routes run in the Big Data Bowl 2025 dataset',
+             'Players required a minimum of 100 routes run in the Big Data Bowl 2025 dataset',
              font = 'Arial', fontsize = 8, fontweight = 'normal',
              ha = 'left', va = 'center', fontstyle = 'italic')
 
@@ -428,7 +424,7 @@ if createVisuals:
 # =========================================================================
 
 # Check for calculating
-if calcHeadStartIndex:
+if calcInMotionIndex:
 
     # Set-up dictionary to store data
     teamPlaysDict = {'teamAbbr': [], 'nStationaryPlays': [], 'nMotionPlays': []}
@@ -484,13 +480,6 @@ if calcHeadStartIndex:
     teamMotionDf['propInMotion'] = teamMotionDf['nMotionPlays'] / (teamMotionDf['nMotionPlays']+teamMotionDf['nStationaryPlays'])
     teamMotionDf.sort_values(by = 'propInMotion', ascending = False, inplace = True)
 
-    # Display data for in-motion routes by teams
-    # Note that this includes some zeros for teams that are no longer in competition!
-    for ii in range(len(teamMotionDf)):
-        # Print out summary
-        print(f'#{ii+1}: {teamMotionDf.iloc[ii]["teamAbbr"]} - '
-              f'{"{0:.2f}".format(teamMotionDf.iloc[ii]["propInMotion"]*100)}% of passing plays with player in motion at snap')
-
 else:
 
     # Load the already extracted team data
@@ -503,6 +492,16 @@ else:
     # Calculate proportion of in-motion plays and sort by these values
     teamMotionDf['propInMotion'] = teamMotionDf['nMotionPlays'] / (teamMotionDf['nMotionPlays'] + teamMotionDf['nStationaryPlays'])
     teamMotionDf.sort_values(by='propInMotion', ascending=False, inplace=True)
+
+# Check for calculating if results need to be printed
+if calcInMotionIndex:
+
+    # Display data for in-motion routes by teams
+    # Note that this includes some zeros for teams that are no longer in competition!
+    for ii in range(len(teamMotionDf)):
+        # Print out summary
+        print(f'#{ii + 1}: {teamMotionDf.iloc[ii]["teamAbbr"]} - '
+              f'{"{0:.2f}".format(teamMotionDf.iloc[ii]["propInMotion"] * 100)}% of passing plays with player in motion at snap')
 
 # =========================================================================
 # Create visual of top 10 teams for motion at snap
@@ -614,6 +613,98 @@ if createVisuals:
     plt.close('all')
 
 # =========================================================================
+# Explore situational characteristics of in motion routes
+# =========================================================================
+
+# Check for summarising data
+if summariseData:
+
+    # Extract passing plays from global play dataset
+    passPlays = plays.loc[plays['isDropback']]
+
+    # Set variable to store in motion route outcome
+    inMotionRoutePlay = []
+
+    # Loop through game and play Id's to identify whether an in motion route occurred
+    # -------------------------------------------------------------------------
+    print('Exploring passing plays for in motion routes...')
+    for ii in tqdm(range(len(passPlays))):
+
+        # Get game and play Id
+        gameId = passPlays['gameId'].iloc[ii]
+        playId = passPlays['playId'].iloc[ii]
+
+        # Get possession team for current play
+        posTeam = passPlays.loc[(passPlays['gameId'] == gameId) &
+                                (passPlays['playId'] == playId)]['possessionTeam'].values[0]
+
+        # Extract in motion player info for current play
+        inMotionAtSnap = player_play.loc[
+            (player_play['gameId'] == gameId) &
+            (player_play['playId'] == playId) &
+            (player_play['teamAbbr'] == posTeam)
+            ]['inMotionAtBallSnap'].to_list()
+
+        # Extract whether route was run at snap
+        runningRoute = player_play.loc[
+            (player_play['gameId'] == gameId) &
+            (player_play['playId'] == playId) &
+            (player_play['teamAbbr'] == posTeam)
+            ]['wasRunningRoute'].to_list()
+
+        # Look up combinations and sum
+        nPlayersInMotionRouteAtSnap = np.sum([inMotionAtSnap[ii] == True and runningRoute[ii] == 1.0 for ii in range(len(inMotionAtSnap))])
+
+        # Allocate outcome from play
+        if nPlayersInMotionRouteAtSnap > 0:
+            inMotionRoutePlay.append(True)
+        else:
+            inMotionRoutePlay.append(False)
+
+    # Append to pass plays dataframe
+    passPlays['inMotionRoutePlay'] = inMotionRoutePlay
+
+    # Explore characteristics of in motion route plays
+    # -------------------------------------------------------------------------
+
+    # Extract the in motion route plays from passing dataset
+    passPlaysInMotion = passPlays.loc[passPlays['inMotionRoutePlay']]
+
+    # Print out summary value for number of in motion route plays
+    print(f'Total number of passing plays with receiver in motion at the snap: {len(passPlaysInMotion)}')
+
+    # Group by offensive formation to explore frequency
+    groupedOffenseFormation = passPlaysInMotion.groupby('offenseFormation').count()['playId'].copy()
+    groupedOffenseFormation.sort_values(ascending = False, inplace = True)
+    print(f'{"*"*10} In Motion Route Plays by Offense Formation {"*"*10}')
+    for formation in groupedOffenseFormation.index:
+        print(f'{formation}: {groupedOffenseFormation[formation]} plays ({"{0:.2f}".format(groupedOffenseFormation[formation] / len(passPlaysInMotion) * 100)}%)')
+
+    # Group by receiver alignment to explore frequency
+    groupedReceiverAlignment = passPlaysInMotion.groupby('receiverAlignment').count()['playId'].copy()
+    groupedReceiverAlignment.sort_values(ascending=False, inplace=True)
+    print(f'{"*" * 10} In Motion Route Plays by Receiver Alignment {"*" * 10}')
+    for alignment in groupedReceiverAlignment.index:
+        print(
+            f'{alignment} alignment: {groupedReceiverAlignment[alignment]} plays ({"{0:.2f}".format(groupedReceiverAlignment[alignment] / len(passPlaysInMotion) * 100)}%)')
+
+    # Group by down to explore frequency
+    groupedDown = passPlaysInMotion.groupby('down').count()['playId'].copy()
+    groupedDown.sort_values(ascending=False, inplace=True)
+    print(f'{"*" * 10} In Motion Route Plays by Down {"*" * 10}')
+    for down in groupedDown.index:
+        print(
+            f'Down {down}: {groupedDown[down]} plays ({"{0:.2f}".format(groupedDown[down] / len(passPlaysInMotion) * 100)}%)')
+
+    # Group by quarter to explore frequency
+    groupedQuarter = passPlaysInMotion.groupby('quarter').count()['playId'].copy()
+    groupedQuarter.sort_values(ascending=False, inplace=True)
+    print(f'{"*" * 10} In Motion Route Plays by Quarter {"*" * 10}')
+    for quarter in groupedQuarter.index:
+        print(
+            f'Quarter {quarter}: {groupedQuarter[quarter]} plays ({"{0:.2f}".format(groupedQuarter[quarter] / len(passPlaysInMotion) * 100)}%)')
+
+# =========================================================================
 # Collate individual player route data for calculating index
 # =========================================================================
 
@@ -625,22 +716,14 @@ Metrics included in this section from calculations:
     > reception: a boolean of whether or not the player did vs. didn't get the reception on the play
     > yards: with receptions, the total number of yards on the play
     > yac: with receptions, the number of yards after the catch on the play
-    > releaseSpeed: average player velocity in the first second after the snap
-    > createdSpace: ...3 yards space at least 0.5 seconds...?
-    > createdSpaceEarly: ...3 yards space at least 0.5 seconds in first X seconds after snap...?
-    
-TO CONSIDER ADDING:
+    > peakSeparation: maximum separation from closest defender in yards from the minimum time to throw in dataset to the pass frame
     > separationAtCatch: with receptions, the separation in yards from nearest defender at the catch
-    > some sort of separation measure against man coverage?
-        >> separation relative to starting separation at catch (peak of this or something?)
-        >> needs to be separation CREATED, which could get muddied if not in press coverage at snap?
-    > average separation in first X seconds after snap when throw is expected?
-    > average route speed?
+    > releaseSpeed: average player velocity in the first second after the snap
 
 """
 
 # Check for running calculations
-if calcHeadStartIndex:
+if calcInMotionIndex:
 
     # Settings
     # -------------------------------------------------------------------------
@@ -656,7 +739,15 @@ if calcHeadStartIndex:
     openTime = 0.5  # seconds
     openFramesN = openTime / 0.1
 
-    # TODO: open early idea? How many seconds? less than average?
+    # Calculate 25th percentile for time to throw in dataset
+    # Calculated on frame rate of 0.1 seconds per frame
+    timeToThrow25 = plays['timeToThrow'].describe()['25%']
+    timeToThrow25FramesN = int(np.round(timeToThrow25 / 0.1))
+
+    # Get the minimum time to through in the dataset
+    # Calculated on frame rate of 0.1 seconds per frame
+    timeToThrowMin = plays['timeToThrow'].describe()['min']
+    timeToThrowMinFramesN = int(np.round(timeToThrowMin / 0.1))
 
     # Columns of route data to work through
     analyseColumns = ['stationRoutePlays', 'motionRoutePlays']
@@ -669,7 +760,9 @@ if calcHeadStartIndex:
         # Create a dictionary to store route result data in
         playerData = {'nflId': [], 'gameId': [], 'playId': [], 'inMotionAtSnap': [],
                       'targeted': [], 'reception': [], 'catch': [], 'yards': [], 'yac': [],
-                      'createdSpace': [], 'createdSpaceEarly': [], 'separationAtCatch': [], 'releaseSpeed': []}
+                      'createdSpace': [], 'createdSpaceEarly': [],
+                      'peakSeparation': [], 'separationAtCatch': [],
+                      'releaseSpeed': []}
 
         # Loop through the analysis columns
         # -------------------------------------------------------------------------
@@ -735,20 +828,23 @@ if calcHeadStartIndex:
                     yards = np.nan
                     yac = np.nan
 
-                # Get space creation variables
+                # Get space creation and separation variables
                 # -------------------------------------------------------------------------
 
                 # Calculate openness across play and in short time frame after snap
 
-                # Get snap and either the pass frame or where QB is sacked/stripped
+                # Get snap and the frame of the first listed pass event
                 snapFrameId = currPlayTrackingData.loc[currPlayTrackingData['frameType'] == 'SNAP']['frameId'].unique()[0]
-                if 'pass_forward' in currPlayTrackingData['event'].unique():
-                    passFrameId = currPlayTrackingData.loc[currPlayTrackingData['event'] == 'pass_forward']['frameId'].unique()[0]
-                elif 'qb_sack' in currPlayTrackingData['event'].unique():
-                    passFrameId = currPlayTrackingData.loc[currPlayTrackingData['event'] == 'qb_sack']['frameId'].unique()[0]
-                elif 'qb_strip_sack' in currPlayTrackingData['event'].unique():
-                    passFrameId = currPlayTrackingData.loc[currPlayTrackingData['event'] == 'qb_strip_sack']['frameId'].unique()[0]
-                # TODO: open early frame id? How many seconds?
+                # Get pass event name
+                passEvent = [str(eventName) for eventName in currPlayTrackingData['event'].unique().tolist() if str(eventName).startswith('pass_')][0]
+                # Get the pass event frame
+                passFrameId = currPlayTrackingData.loc[currPlayTrackingData['event'] == passEvent]['frameId'].unique()[0]
+
+                # Get frame Id for 'early' after snap
+                # Check if this is more than pass frame and alter if necessary
+                earlyFrameId = snapFrameId + timeToThrow25FramesN
+                if earlyFrameId > passFrameId:
+                    earlyFrameId = passFrameId
 
                 # Get players position from snap to pass
                 playerXY = currPlayPlayerTrackingData.loc[
@@ -779,21 +875,34 @@ if calcHeadStartIndex:
                     # Set minimum defender distance for current frame
                     minDefDist[frameInd] = np.min(defDist)
 
+                # Get the minimum defender distance in the early time frame
+                if earlyFrameId == passFrameId:
+                    minDefDistEarly = minDefDist
+                else:
+                    minDefDistEarly = minDefDist[0:earlyFrameId-snapFrameId]
+
                 # Default creating space variable to False
                 createdSpace = False
+                createdSpaceEarly = False
 
                 # Identify length of consecutive frames where player was considered open based on distance
                 lenOpen = []
+                lenOpenEarly = []
                 for jj,kk in groupby(minDefDist >= openDistance):
                     if jj == True:
                         lenOpen.append(len(list(kk)))
+                for jj, kk in groupby(minDefDistEarly >= openDistance):
+                    if jj == True:
+                        lenOpenEarly.append(len(list(kk)))
 
                 # If any open periods are greater than the frames threshold change the variable to True
                 if any(np.array(lenOpen) >= openFramesN):
                     createdSpace = True
+                if any(np.array(lenOpenEarly) >= openFramesN):
+                    createdSpaceEarly = True
 
-                # Get separation variables
-                # -------------------------------------------------------------------------
+                # Calculate the peak separation
+                peakSeparation = np.max(minDefDist[timeToThrowMinFramesN::])
 
                 # Get separation at catch if appropriate
                 if reception:
@@ -866,7 +975,8 @@ if calcHeadStartIndex:
                 playerData['yards'].append(yards)
                 playerData['yac'].append(yac)
                 playerData['createdSpace'].append(createdSpace)
-                playerData['createdSpaceEarly'].append('TODO')
+                playerData['createdSpaceEarly'].append(createdSpaceEarly)
+                playerData['peakSeparation'].append(peakSeparation)
                 playerData['separationAtCatch'].append(separationAtCatch)
                 playerData['releaseSpeed'].append(releaseSpeed)
 
@@ -880,72 +990,137 @@ if calcHeadStartIndex:
 
 """
 
-The below section is commented out but offers some basic print outs to review
+The below section is commented offers some basic print outs to review
 the stationary vs. in-motion summary data for a given player.
 
 """
 
-# # Set player Id to look up (Travis Kelce used as an example here)
-# nflId = 40011
-#
-# # Load in players data
-# with open(os.path.join('..', 'outputs', 'player', f'{nflId}_routeData.pkl'), 'rb') as pklFile:
-#     playerData = pd.DataFrame.from_dict(pickle.load(pklFile))
-#
-# # Print out some basic descriptives
-# print(f'Summary data for {players.loc[players["nflId"] == nflId]["displayName"].values[0]}')
-#
-# # Target rate
-# # Get data to support descriptions
-# summaryData = playerData.groupby(['inMotionAtSnap','targeted']).count()
-# # Print out data
-# print(f'{"*"*20} TARGET RATE {"*"*20}')
-# print(f'Targeted on {summaryData.loc[(False,True)]["nflId"]} of {len(playerData.loc[playerData["inMotionAtSnap"] == False])} routes when stationary at snap '
-#       f'({"{0:.2f}".format(summaryData.loc[(False,True)]["nflId"] / len(playerData.loc[playerData["inMotionAtSnap"] == False]) * 100)}% of stationary routes)')
-# print(f'Targeted on {summaryData.loc[(True,True)]["nflId"]} of {len(playerData.loc[playerData["inMotionAtSnap"] == True])} routes when in-motion at snap '
-#       f'({"{0:.2f}".format(summaryData.loc[(True,True)]["nflId"] / len(playerData.loc[playerData["inMotionAtSnap"] == True]) * 100)}% of in-motion routes)')
-#
-# # Reception rate
-# # Get data to support descriptions
-# summaryData = playerData.groupby(['inMotionAtSnap','reception']).count()
-# # Print out data
-# print(f'{"*"*20} RECEPTION RATE {"*"*20}')
-# print(f'Received pass on {summaryData.loc[(False,True)]["nflId"]} of {len(playerData.loc[playerData["inMotionAtSnap"] == False])} routes when stationary at snap '
-#       f'({"{0:.2f}".format(summaryData.loc[(False,True)]["nflId"] / len(playerData.loc[playerData["inMotionAtSnap"] == False]) * 100)}% of stationary routes)')
-# print(f'Received pass on {summaryData.loc[(True,True)]["nflId"]} of {len(playerData.loc[playerData["inMotionAtSnap"] == True])} routes when in-motion at snap '
-#       f'({"{0:.2f}".format(summaryData.loc[(True,True)]["nflId"] / len(playerData.loc[playerData["inMotionAtSnap"] == True]) * 100)}% of in-motion routes)')
-#
-# # Average yards
-# # Get data to support descriptions
-# summaryData = playerData.groupby(['inMotionAtSnap'])['yards'].mean()
-# # Print out data
-# print(f'{"*"*20} AVERAGE YARDS {"*"*20}')
-# print(f'Average receiving yards when stationary at snap: {"{0:.2f}".format(summaryData[False])}')
-# print(f'Average receiving yards when in-motion at snap: {"{0:.2f}".format(summaryData[True])}')
-#
-# # Average yards after catch
-# # Get data to support descriptions
-# summaryData = playerData.groupby(['inMotionAtSnap'])['yac'].mean()
-# # Print out data
-# print(f'{"*"*20} AVERAGE YARDS AFTER CATCH {"*"*20}')
-# print(f'Average yards after catch when stationary at snap: {"{0:.2f}".format(summaryData[False])}')
-# print(f'Average yards after catch when in-motion at snap: {"{0:.2f}".format(summaryData[True])}')
-#
-# # Average separation at catch
-# # Get data to support descriptions
-# summaryData = playerData.groupby(['inMotionAtSnap'])['separationAtCatch'].mean()
-# # Print out data
-# print(f'{"*"*20} AVERAGE SEPARATION AT CATCH {"*"*20}')
-# print(f'Average separation at catch when stationary at snap: {"{0:.2f}".format(summaryData[False])}')
-# print(f'Average separation at catch when in-motion at snap: {"{0:.2f}".format(summaryData[True])}')
-#
-# # Average release speed
-# # Get data to support descriptions
-# summaryData = playerData.groupby(['inMotionAtSnap'])['releaseSpeed'].mean()
-# # Print out data
-# print(f'{"*"*20} AVERAGE RELEASE SPEED {"*"*20}')
-# print(f'Average release speed when stationary at snap: {"{0:.2f}".format(summaryData[False])}')
-# print(f'Average release speed when in-motion at snap: {"{0:.2f}".format(summaryData[True])}')
+# Check for summarising data
+if summariseData:
+
+    # Set player Id to look up (Travis Kelce used as an example here)
+    nflId = 40011
+
+    # Load in players data
+    with open(os.path.join('..', 'outputs', 'player', f'{nflId}_routeData.pkl'), 'rb') as pklFile:
+        playerData = pd.DataFrame.from_dict(pickle.load(pklFile))
+
+    # Print out some basic descriptives
+    print(f'Summary data for {players.loc[players["nflId"] == nflId]["displayName"].values[0]}')
+
+    # Target rate
+    # Get data to support descriptions
+    summaryData = playerData.groupby(['inMotionAtSnap','targeted']).count()
+    # Print out data
+    print(f'{"*"*20} TARGET RATE {"*"*20}')
+    print(f'Targeted on {summaryData.loc[(False,True)]["nflId"]} of {len(playerData.loc[playerData["inMotionAtSnap"] == False])} routes when stationary at snap '
+          f'({"{0:.2f}".format(summaryData.loc[(False,True)]["nflId"] / len(playerData.loc[playerData["inMotionAtSnap"] == False]) * 100)}% of stationary routes)')
+    print(f'Targeted on {summaryData.loc[(True,True)]["nflId"]} of {len(playerData.loc[playerData["inMotionAtSnap"] == True])} routes when in-motion at snap '
+          f'({"{0:.2f}".format(summaryData.loc[(True,True)]["nflId"] / len(playerData.loc[playerData["inMotionAtSnap"] == True]) * 100)}% of in-motion routes)')
+
+    # Reception rate
+    # Get data to support descriptions
+    summaryData = playerData.groupby(['inMotionAtSnap','reception']).count()
+    # Print out data
+    print(f'{"*"*20} RECEPTION RATE {"*"*20}')
+    print(f'Received pass on {summaryData.loc[(False,True)]["nflId"]} of {len(playerData.loc[playerData["inMotionAtSnap"] == False])} routes when stationary at snap '
+          f'({"{0:.2f}".format(summaryData.loc[(False,True)]["nflId"] / len(playerData.loc[playerData["inMotionAtSnap"] == False]) * 100)}% of stationary routes)')
+    print(f'Received pass on {summaryData.loc[(True,True)]["nflId"]} of {len(playerData.loc[playerData["inMotionAtSnap"] == True])} routes when in-motion at snap '
+          f'({"{0:.2f}".format(summaryData.loc[(True,True)]["nflId"] / len(playerData.loc[playerData["inMotionAtSnap"] == True]) * 100)}% of in-motion routes)')
+
+    # Average yards
+    # Get data to support descriptions
+    summaryData = playerData.groupby(['inMotionAtSnap'])['yards'].mean()
+    # Print out data
+    print(f'{"*"*20} AVERAGE YARDS {"*"*20}')
+    print(f'Average receiving yards when stationary at snap: {"{0:.2f}".format(summaryData[False])}')
+    print(f'Average receiving yards when in-motion at snap: {"{0:.2f}".format(summaryData[True])}')
+
+    # Average yards after catch
+    # Get data to support descriptions
+    summaryData = playerData.groupby(['inMotionAtSnap'])['yac'].mean()
+    # Print out data
+    print(f'{"*"*20} AVERAGE YARDS AFTER CATCH {"*"*20}')
+    print(f'Average yards after catch when stationary at snap: {"{0:.2f}".format(summaryData[False])}')
+    print(f'Average yards after catch when in-motion at snap: {"{0:.2f}".format(summaryData[True])}')
+
+    # Average separation at catch
+    # Get data to support descriptions
+    summaryData = playerData.groupby(['inMotionAtSnap'])['separationAtCatch'].mean()
+    # Print out data
+    print(f'{"*"*20} AVERAGE SEPARATION AT CATCH {"*"*20}')
+    print(f'Average separation at catch when stationary at snap: {"{0:.2f}".format(summaryData[False])}')
+    print(f'Average separation at catch when in-motion at snap: {"{0:.2f}".format(summaryData[True])}')
+
+    # Average release speed
+    # Get data to support descriptions
+    summaryData = playerData.groupby(['inMotionAtSnap'])['releaseSpeed'].mean()
+    # Print out data
+    print(f'{"*"*20} AVERAGE RELEASE SPEED {"*"*20}')
+    print(f'Average release speed when stationary at snap: {"{0:.2f}".format(summaryData[False])}')
+    print(f'Average release speed when in-motion at snap: {"{0:.2f}".format(summaryData[True])}')
+
+# =========================================================================
+# Check eligibility for in motion index
+# =========================================================================
+
+"""
+
+There are circumstances where the IMI metrics can't be calculated for a player,
+so the dataset is reduced here to only include players with at least:
+
+    > At least 10 stationary routes & 10 in-motion routes
+    > At least 1 target on stationary and 1 target on in motion routes
+    > At least 1 catch on stationary and 1 catch on in motion routes
+
+Players that don't meet these criteria are excluded at the calculation step.
+
+There will also be some IMI indices that can't be calculated for certain players
+given the limited sample size of some outcomes.
+
+"""
+
+# Create list to store eligibility
+eligibleIMI = []
+
+# Loop through route runners
+for nflId in routeData['nflId']:
+
+    # Load in the player route data and convert to dataframe for ease of use
+    with open(os.path.join('..', 'outputs', 'player', f'{nflId}_routeData.pkl'), 'rb') as pklFile:
+        playerData = pd.DataFrame.from_dict(pickle.load(pklFile))
+
+    # Get data to run checks for including player
+    # If any of these fail given the data isn't there then the player won't meet the criteria anyway
+    try:
+
+        # Get data
+        stationaryRoutes = playerData.groupby('inMotionAtSnap').count().loc[False]['nflId']
+        inMotionRoutes = playerData.groupby('inMotionAtSnap').count().loc[True]['nflId']
+        stationaryTarget = playerData.groupby(['inMotionAtSnap', 'targeted']).count().loc[(False, True)]['nflId']
+        inMotionTarget = playerData.groupby(['inMotionAtSnap', 'targeted']).count().loc[(True, True)]['nflId']
+        stationaryRec = playerData.groupby(['inMotionAtSnap', 'reception']).count().loc[(False, True)]['nflId']
+        inMotionRec = playerData.groupby(['inMotionAtSnap', 'reception']).count().loc[(True, True)]['nflId']
+
+        # Check to keep player
+        if all([
+            stationaryRoutes >= 10, inMotionRoutes >= 10,
+            stationaryTarget > 0, inMotionTarget > 0,
+            stationaryRec > 0, inMotionRec > 0
+        ]):
+            keepPlayer = True
+        else:
+            keepPlayer = False
+    except:
+        keepPlayer = False
+
+    # Append to list if appropriate
+    if keepPlayer:
+        eligibleIMI.append(nflId)
+
+# Check number of eligible vs. ineligible
+print(f'Players eligible for IMI calculations: {len(eligibleIMI)}')
+print(f'Players removed from IMI calculations: {len(routeData["nflId"]) - len(eligibleIMI)}')
 
 # =========================================================================
 # Calculate in motion index metrics
@@ -953,378 +1128,1028 @@ the stationary vs. in-motion summary data for a given player.
 
 """
 
-Here is where the individual in motion indice values are calculated. There are
-circumstances where the HSI metrics can't be calculated for a player, so the dataset
-is reduced here to only include players with at least:
-
-    > At least 5 stationary & in-motion routes
-    > 1 target on stationary routes
-    > 1 target on motion routes
-    > 1 catch on stationary routes
-    > 1 catch on motion routes
-
-Players that don't meet these criteria are excluded at this step.
-
-There will also be some HSI indices that can't be calculated for certaimn players
-given the limited sample size of some outcomes.
+Here is where the individual in motion indice values are calculated. Although 
+there were some eligibility checks, there will still likely be some IMI indices
+that can't be calculated for certain players given the limited sample size of
+some outcomes.
 
 """
 
 # Check for running calculations
-if calcHeadStartIndex:
+if calcInMotionIndex:
 
     # Settings
     # -------------------------------------------------------------------------
 
-    # Set number of samples to take
+    # Set number of samples to take in Monte Carlo approach
     nSamples = 10000
 
-    # Set-up dictionary to store index calculations
-    hsiData = {'nflId': [], 'targetedHSI': [], 'targetedHSI_lower': [], 'targetedHSI_upper': [],
-               'receptionHSI': [], 'receptionHSI_lower': [], 'receptionHSI_upper': [],
-               'catchRateHSI': [], 'catchRateHSI_lower': [], 'catchRateHSI_upper': [],
-               'yardsHSI': [], 'yardsHSI_lower': [], 'yardsHSI_upper': [],
-               'yacHSI': [], 'yacHSI_lower': [], 'yacHSI_upper': [],
-               'separationAtCatchHSI': [], 'separationAtCatchHSI_lower': [], 'separationAtCatchHSI_upper': [],
-               'releaseSpeedHSI': [], 'releaseSpeedHSI_lower': [], 'releaseSpeedHSI_upper': [],
-               }
-
-    # Loop through route runners
+    # Loop through eligible route runners
     # -------------------------------------------------------------------------
-    for nflId in tqdm(routeData['nflId']):
+    print('Calculating IMI for eligible route runners...')
+    for nflId in tqdm(eligibleIMI):
 
         # Load in the player route data and convert to dataframe for ease of use
         with open(os.path.join('..', 'outputs', 'player', f'{nflId}_routeData.pkl'), 'rb') as pklFile:
             playerData = pd.DataFrame.from_dict(pickle.load(pklFile))
 
-        # Get data to run checks for including player
-        # If any of these fail the player won't meet the criteria anyway
-        try:
-            # Get data
-            stationaryRoutes = playerData.groupby('inMotionAtSnap').count().loc[False]['nflId']
-            inMotionRoutes = playerData.groupby('inMotionAtSnap').count().loc[True]['nflId']
-            stationaryTarget = playerData.groupby(['inMotionAtSnap', 'targeted']).count().loc[(False, True)]['nflId']
-            inMotionTarget = playerData.groupby(['inMotionAtSnap', 'targeted']).count().loc[(True, True)]['nflId']
-            stationaryCatch = playerData.groupby(['inMotionAtSnap', 'reception']).count().loc[(False, True)]['nflId']
-            inMotionCatch = playerData.groupby(['inMotionAtSnap', 'reception']).count().loc[(True, True)]['nflId']
-            # Check to keep player
-            if all([
-                stationaryRoutes >= 5, inMotionRoutes >= 5,
-                stationaryTarget > 0, inMotionTarget > 0,
-                stationaryCatch > 0, inMotionCatch > 0
-            ]):
-                keepPlayer = True
-            else:
-                keepPlayer = False
-        except:
-            keepPlayer = False
+        # Get summary data to support calculations
+        playerCountData = playerData.groupby(['inMotionAtSnap','reception']).count()
 
-        # Determine whether to include player
-        if keepPlayer:
+        # Get supporting data for IMI calculations
+        # -------------------------------------------------------------------------
 
-            # Set player Id in dictionary
-            hsiData['nflId'].append(nflId)
+        # Create dictionary to store data in
+        calcImiData = {}
 
-            # Get summary data to support calculations
-            playerCountData = playerData.groupby(['inMotionAtSnap','reception']).count()
-
-            # Target rate boost
-            # -------------------------------------------------------------------------
+        # Loop through boolean variables to extract data for
+        for dataVar in ['targeted', 'reception',
+                        # 'createdSpace', 'createdSpaceEarly'
+                        ]:
+            # Create key in dictionary
+            calcImiData[dataVar] = {}
+            # Extract data using try:except to avoid errors and allocate zeros where appropriate
             try:
-
-                # Get target vs. non-targeted numbers from stationary vs. in-motion routes
-                targetStationary = playerData.groupby(['inMotionAtSnap', 'targeted']).count().loc[(False,True)]['nflId']
-                nonTargetStationary = playerData.groupby(['inMotionAtSnap', 'targeted']).count().loc[(False, False)]['nflId']
-                targetInMotion = playerData.groupby(['inMotionAtSnap', 'targeted']).count().loc[(True, True)]['nflId']
-                nonTargetInMotion = playerData.groupby(['inMotionAtSnap', 'targeted']).count().loc[(True, False)]['nflId']
-
-                # Calculate relative ratios for metric from counts
-                hsiMetric, hsiLower, hsiUpper = relRatiosFromCounts((targetStationary,nonTargetStationary),
-                                                                    (targetInMotion,nonTargetInMotion),
-                                                                    (nflId+123, nflId+321), nSamples)
-
-                # Store values in dictionary
-                hsiData['targetedHSI'].append(hsiMetric)
-                hsiData['targetedHSI_lower'].append(hsiLower)
-                hsiData['targetedHSI_upper'].append(hsiUpper)
-
+                calcImiData[dataVar]['stationaryTrue'] = playerData.groupby(['inMotionAtSnap', dataVar]).count().loc[(False, True)]['nflId']
             except:
-
-                # No data available so set as nan
-                hsiData['targetedHSI'].append(np.nan)
-                hsiData['targetedHSI_lower'].append(np.nan)
-                hsiData['targetedHSI_upper'].append(np.nan)
-
-            # Reception rate boost
-            # -------------------------------------------------------------------------
+                calcImiData[dataVar]['stationaryTrue'] = 0
             try:
-
-                # Get receptions vs. non-reception numbers from stationary vs. in-motion routes
-                receptionStationary = playerData.groupby(['inMotionAtSnap', 'reception']).count().loc[(False, True)]['nflId']
-                nonReceptionStationary = playerData.groupby(['inMotionAtSnap', 'reception']).count().loc[(False, False)]['nflId']
-                receptionInMotion = playerData.groupby(['inMotionAtSnap', 'reception']).count().loc[(True, True)]['nflId']
-                nonReceptionInMotion = playerData.groupby(['inMotionAtSnap', 'reception']).count().loc[(True, False)]['nflId']
-
-                # Calculate relative ratios for metric from counts
-                hsiMetric, hsiLower, hsiUpper = relRatiosFromCounts((receptionStationary, nonReceptionStationary),
-                                                                    (receptionInMotion, nonReceptionInMotion),
-                                                                    (nflId + 1234, nflId + 4321), nSamples)
-
-                # Store values in dictionary
-                hsiData['receptionHSI'].append(hsiMetric)
-                hsiData['receptionHSI_lower'].append(hsiLower)
-                hsiData['receptionHSI_upper'].append(hsiUpper)
-
+                calcImiData[dataVar]['stationaryFalse'] = playerData.groupby(['inMotionAtSnap', dataVar]).count().loc[(False, False)]['nflId']
             except:
-
-                # No data available so set as nan
-                hsiData['receptionHSI'].append(np.nan)
-                hsiData['receptionHSI_lower'].append(np.nan)
-                hsiData['receptionHSI_upper'].append(np.nan)
-
-            # Catch rate boos
-            # -------------------------------------------------------------------------
+                calcImiData[dataVar]['stationaryFalse'] = 0
             try:
-
-                # Get mean & SD for yards from stationary vs. in-motion routes
-                catchStationary = playerData.groupby(['inMotionAtSnap', 'targeted', 'reception']).count().loc[(False, True, True)]['nflId']
-                noCatchStationary = playerData.groupby(['inMotionAtSnap', 'targeted', 'reception']).count().loc[(False, True, False)]['nflId']
-                catchInMotion = playerData.groupby(['inMotionAtSnap', 'targeted', 'reception']).count().loc[(True, True, True)]['nflId']
-                noCatchInMotion = playerData.groupby(['inMotionAtSnap', 'targeted', 'reception']).count().loc[(True, True, False)]['nflId']
-
-                # Calculate relative ratios for metric from counts
-                hsiMetric, hsiLower, hsiUpper = relRatiosFromCounts((catchStationary, noCatchStationary),
-                                                                    (catchInMotion, noCatchInMotion),
-                                                                    (nflId + 12345, nflId + 54321), nSamples)
-
-                # Store values in dictionary
-                hsiData['catchRateHSI'].append(hsiMetric)
-                hsiData['catchRateHSI_lower'].append(hsiLower)
-                hsiData['catchRateHSI_upper'].append(hsiUpper)
-
+                calcImiData[dataVar]['inMotionTrue'] = playerData.groupby(['inMotionAtSnap', dataVar]).count().loc[(True, True)]['nflId']
             except:
-
-                # No data available so set as nan
-                hsiData['catchRateHSI'].append(np.nan)
-                hsiData['catchRateHSI_lower'].append(np.nan)
-                hsiData['catchRateHSI_upper'].append(np.nan)
-
-            # Yards boost
-            # -------------------------------------------------------------------------
+                calcImiData[dataVar]['inMotionTrue'] = 0
             try:
-
-                # Get mean & SD for yards from stationary vs. in-motion routes
-                yardsStationaryMu = playerData.groupby(['inMotionAtSnap']).mean()['yards'].loc[False]
-                yardsStationarySigma = playerData.groupby(['inMotionAtSnap']).std()['yards'].loc[False]
-                yardsInMotionMu = playerData.groupby(['inMotionAtSnap']).mean()['yards'].loc[True]
-                yardsInMotionSigma = playerData.groupby(['inMotionAtSnap']).std()['yards'].loc[True]
-
-                # Calculate relative ratios for metric from continuous values
-                hsiMetric, hsiLower, hsiUpper = relRatiosFromContinuous((yardsStationaryMu, yardsStationarySigma),
-                                                                        (yardsInMotionMu, yardsInMotionSigma),
-                                                                        (nflId + 345, nflId + 543), nSamples)
-
-                # Store values in dictionary
-                hsiData['yardsHSI'].append(hsiMetric)
-                hsiData['yardsHSI_lower'].append(hsiLower)
-                hsiData['yardsHSI_upper'].append(hsiUpper)
-
+                calcImiData[dataVar]['inMotionFalse'] = playerData.groupby(['inMotionAtSnap', dataVar]).count().loc[(True, False)]['nflId']
             except:
+                calcImiData[dataVar]['inMotionFalse'] = 0
 
-                # No data available so set as nan
-                hsiData['yardsHSI'].append(np.nan)
-                hsiData['yardsHSI_lower'].append(np.nan)
-                hsiData['yardsHSI_upper'].append(np.nan)
+        # Loop through continuous variables to extract data for
+        for dataVar in ['yards', 'yac', 'peakSeparation', 'separationAtCatch', 'releaseSpeed']:
+            # Create key in dictionary
+            calcImiData[dataVar] = {}
+            # Extract data using (unlikely to need try/except given eligibility criteria)
+            calcImiData[dataVar]['stationaryMu'] = playerData.groupby(['inMotionAtSnap']).mean(numeric_only=True)[dataVar].loc[False]
+            calcImiData[dataVar]['stationarySigma'] = playerData.groupby(['inMotionAtSnap']).std(numeric_only=True)[dataVar].loc[False]
+            calcImiData[dataVar]['inMotionMu'] = playerData.groupby(['inMotionAtSnap']).mean(numeric_only=True)[dataVar].loc[True]
+            calcImiData[dataVar]['inMotionSigma'] = playerData.groupby(['inMotionAtSnap']).std(numeric_only=True)[dataVar].loc[True]
 
-            # YAC boost
-            # -------------------------------------------------------------------------
-            try:
+        # Calculate IMI values
+        # -------------------------------------------------------------------------
 
-                # Get mean & SD for yards from stationary vs. in-motion routes
-                yacStationaryMu = playerData.groupby(['inMotionAtSnap']).mean()['yac'].loc[False]
-                yacStationarySigma = playerData.groupby(['inMotionAtSnap']).std()['yac'].loc[False]
-                yacInMotionMu = playerData.groupby(['inMotionAtSnap']).mean()['yac'].loc[True]
-                yacInMotionSigma = playerData.groupby(['inMotionAtSnap']).std()['yac'].loc[True]
+        # Use function to calculate IMI
+        imiResults = calcIMI(calcImiData, weightsIMI, nSamples, nflId)
 
-                # Calculate relative ratios for metric from continuous values
-                hsiMetric, hsiLower, hsiUpper = relRatiosFromContinuous((yacStationaryMu, yacStationarySigma),
-                                                                        (yacInMotionMu, yacInMotionSigma),
-                                                                        (nflId + 2345, nflId + 5432), nSamples)
-
-                # Store values in dictionary
-                hsiData['yacHSI'].append(hsiMetric)
-                hsiData['yacHSI_lower'].append(hsiLower)
-                hsiData['yacHSI_upper'].append(hsiUpper)
-
-            except:
-
-                # No data available so set as nan
-                hsiData['yacHSI'].append(np.nan)
-                hsiData['yacHSI_lower'].append(np.nan)
-                hsiData['yacHSI_upper'].append(np.nan)
-
-            # Separation at catch boost
-            # -------------------------------------------------------------------------
-            try:
-
-                # Get mean & SD for yards from stationary vs. in-motion routes
-                separationStationaryMu = playerData.groupby(['inMotionAtSnap']).mean()['separationAtCatch'].loc[False]
-                separationStationarySigma = playerData.groupby(['inMotionAtSnap']).std()['separationAtCatch'].loc[False]
-                separationInMotionMu = playerData.groupby(['inMotionAtSnap']).mean()['separationAtCatch'].loc[True]
-                separationInMotionSigma = playerData.groupby(['inMotionAtSnap']).std()['separationAtCatch'].loc[True]
-
-                # Calculate relative ratios for metric from continuous values
-                hsiMetric, hsiLower, hsiUpper = relRatiosFromContinuous((separationStationaryMu, separationStationarySigma),
-                                                                        (separationInMotionMu, separationInMotionSigma),
-                                                                        (nflId + 456, nflId + 654), nSamples)
-
-                # Store values in dictionary
-                hsiData['separationAtCatchHSI'].append(hsiMetric)
-                hsiData['separationAtCatchHSI_lower'].append(hsiLower)
-                hsiData['separationAtCatchHSI_upper'].append(hsiUpper)
-
-            except:
-
-                # No data available so set as nan
-                hsiData['separationAtCatchHSI'].append(np.nan)
-                hsiData['separationAtCatchHSI_lower'].append(np.nan)
-                hsiData['separationAtCatchHSI_upper'].append(np.nan)
-
-            # Release speed boost
-            # -------------------------------------------------------------------------
-            try:
-
-                # Get mean & SD for yards from stationary vs. in-motion routes
-                releaseStationaryMu = playerData.groupby(['inMotionAtSnap']).mean()['releaseSpeed'].loc[False]
-                releaseStationarySigma = playerData.groupby(['inMotionAtSnap']).std()['releaseSpeed'].loc[False]
-                releaseInMotionMu = playerData.groupby(['inMotionAtSnap']).mean()['releaseSpeed'].loc[True]
-                releaseInMotionSigma = playerData.groupby(['inMotionAtSnap']).std()['releaseSpeed'].loc[True]
-
-                # Calculate relative ratios for metric from continuous values
-                hsiMetric, hsiLower, hsiUpper = relRatiosFromContinuous((releaseStationaryMu, releaseStationarySigma),
-                                                                        (releaseInMotionMu, releaseInMotionSigma),
-                                                                        (nflId + 4567, nflId + 7654), nSamples)
-
-                # Store values in dictionary
-                hsiData['releaseSpeedHSI'].append(hsiMetric)
-                hsiData['releaseSpeedHSI_lower'].append(hsiLower)
-                hsiData['releaseSpeedHSI_upper'].append(hsiUpper)
-
-            except:
-
-                # No data available so set as nan
-                hsiData['releaseSpeedHSI'].append(np.nan)
-                hsiData['releaseSpeedHSI_lower'].append(np.nan)
-                hsiData['releaseSpeedHSI_upper'].append(np.nan)
-
-    # Convert HSI to dataframe
-    hsiDf = pd.DataFrame.from_dict(hsiData)
-
-
+        # Save dictionary to file
+        with open(os.path.join('..', 'outputs', 'player', f'{nflId}_IMI.pkl'), 'wb') as pklFile:
+            pickle.dump(imiResults, pklFile)
 
 # =========================================================================
-# Visualise the motion in a motion route play
+# Summarise IMI results
 # =========================================================================
 
-# The sample play comes from Travis Kelce (40011)
-nflId = 40011
+# Check for summarising data
+if summariseData:
 
-# Get the first game and play Id from Kelce for an in-motion route
-# TODO: below gives a play that doesn't meet criteria --- check earlier code
-# gameId, playId = routeData.loc[routeData['nflId'] == nflId,]['motionRoutePlays'].values[0][0]
-gameId = 2022091110
-playId = 2720
-weekNo = games.loc[games['gameId'] == gameId]['week'].values[0]
+    # Read in eligible player data to create an export of average values
+    # -------------------------------------------------------------------------
 
-# Get the tracking data for the play
-playTracking = tracking[f'week{weekNo}'].loc[
-    (tracking[f'week{weekNo}']['gameId'] == gameId) &
-    (tracking[f'week{weekNo}']['playId'] == playId)]
+    # Create dictionary to store values
+    playerImiResults = {'nflId': [], 'playerName': [], 'position': [], 'IMI': [],
+                        'targetedIMI': [], 'receptionIMI': [],
+                        'yardsIMI': [], 'yacIMI': [],
+                        'peakSeparationIMI': [], 'separationAtCatchIMI': [],
+                        'releaseSpeedIMI': [],
+                        'nStationaryRoutes': [], 'nInMotionRoutes': [],
+                        'nStationaryReceptions': [], 'nInMotionReceptions': []}
 
-# Get the play description
-playDesc = plays.loc[(plays['gameId'] == gameId) &
-                     (plays['playId'] == playId)]
+    # Loop through eligible players
+    for nflId in eligibleIMI:
 
-# Get the line of scrimmage and down markers
-lineOfScrimmage = playDesc['absoluteYardlineNumber'].to_numpy()[0]
-if playTracking['playDirection'].unique()[0] == 'left':
-    # Get the yards to go and invert for field direction
-    firstDownMark = lineOfScrimmage - playDesc['yardsToGo'].to_numpy()[0]
+        # Read in players IMI results
+        with open(os.path.join('..', 'outputs', 'player', f'{nflId}_IMI.pkl'), 'rb') as pklFile:
+            imiResults = pickle.load(pklFile)
+
+        # Load in the player route data and convert to dataframe for ease of use
+        with open(os.path.join('..', 'outputs', 'player', f'{nflId}_routeData.pkl'), 'rb') as pklFile:
+            playerData = pd.DataFrame.from_dict(pickle.load(pklFile))
+
+        # Get summary data to include in results
+        playerCountData = playerData.groupby(['inMotionAtSnap', 'reception']).count()
+
+        # Extract average data across variables
+        playerImiResults['nflId'].append(nflId)
+        playerImiResults['playerName'].append(rosterData.loc[rosterData['gsis_it_id'] == str(nflId),]['player_name'].values[0])
+        playerImiResults['position'].append(rosterData.loc[rosterData['gsis_it_id'] == str(nflId),]['position'].values[0])
+        playerImiResults['IMI'].append(np.nanmean(imiResults['IMI']['sampleVals']))
+        playerImiResults['targetedIMI'].append(np.nanmean(imiResults['targeted']['mean']))
+        playerImiResults['receptionIMI'].append(np.nanmean(imiResults['reception']['mean']))
+        playerImiResults['yardsIMI'].append(np.nanmean(imiResults['yards']['mean']))
+        playerImiResults['yacIMI'].append(np.nanmean(imiResults['yac']['mean']))
+        playerImiResults['peakSeparationIMI'].append(np.nanmean(imiResults['peakSeparation']['mean']))
+        playerImiResults['separationAtCatchIMI'].append(np.nanmean(imiResults['separationAtCatch']['mean']))
+        playerImiResults['releaseSpeedIMI'].append(np.nanmean(imiResults['releaseSpeed']['mean']))
+        playerImiResults['nStationaryRoutes'].append(len(playerData.loc[playerData['inMotionAtSnap'] == False]))
+        playerImiResults['nInMotionRoutes'].append(len(playerData.loc[playerData['inMotionAtSnap'] == True]))
+        playerImiResults['nStationaryReceptions'].append(len(playerData.loc[(playerData['inMotionAtSnap'] == False) &
+                                                                            (playerData['reception'] == True)]))
+        playerImiResults['nInMotionReceptions'].append(len(playerData.loc[(playerData['inMotionAtSnap'] == True) &
+                                                                          (playerData['reception'] == True)]))
+
+    # Save dictionary format of player IMI results
+    with open(os.path.join('..', 'outputs', 'results', 'playerIMI.pkl'), 'wb') as pklFile:
+            pickle.dump(playerImiResults, pklFile)
+
+    # Convert to dataframe
+    playerImiData = pd.DataFrame.from_dict(playerImiResults)
+
+    # Sort by overall IMI
+    playerImiData.sort_values(by = 'IMI', ascending = False, inplace = True)
+
+    # Export to file
+    # Rename columns here for cleanliness
+    playerImiData.rename(columns = {'nflId': 'NFL ID', 'playerName': 'Player Name', 'position': 'Playing Position', 'IMI': 'IMI',
+                                    'targetedIMI': 'IMI Target Multiplier', 'receptionIMI': 'IMI Reception Multiplier',
+                                    'yardsIMI': 'IMI Yards Multiplier', 'yacIMI': 'IMI YAC Multiplier',
+                                    'peakSeparationIMI': 'IMI Peak Separation Multiplier', 'separationAtCatchIMI': 'IMI Separation at Catch Multiplier',
+                                    'releaseSpeedIMI': 'IMI Release Speed Multiplier',
+                                    'nStationaryRoutes': 'No. of Stationary Routes Run', 'nInMotionRoutes': 'No. of In Motion Routes Run',
+                                    'nStationaryReceptions': 'No. of Receptions on Stationary Routes',
+                                    'nInMotionReceptions': 'No. of Receptions on In Motion Routes'}).to_csv(
+        os.path.join('..', 'outputs', 'results', 'playerIMI.csv'), index = False)
+
+# Otherwise load in saved results
 else:
-    # Use standard values for right directed play
-    firstDownMark = lineOfScrimmage + playDesc['yardsToGo'].to_numpy()[0]
 
-# Get home and away teams for game
-homeTeam = games.loc[games['gameId'] == gameId,]['homeTeamAbbr'].values[0]
-awayTeam = games.loc[games['gameId'] == gameId,]['visitorTeamAbbr'].values[0]
+    # Load the already extracted team data
+    with open(os.path.join('..', 'outputs', 'results', 'playerIMI.pkl'), 'rb') as pklFile:
+        playerImiResults = pickle.load(pklFile)
 
-# Visualise the play at the snap
-# -------------------------------------------------------------------------
+    # Convert to dataframe
+    playerImiData = pd.DataFrame.from_dict(playerImiResults)
 
-# Create the field to plot on
-fieldFig, fieldAx = plt.subplots(figsize=(14, 6.5))
-createField(fieldFig, fieldAx,
-            lineOfScrimmage = lineOfScrimmage, firstDownMark = firstDownMark,
-            homeTeamAbbr = homeTeam, awayTeamAbbr = awayTeam, teamData = teamData)
-
-# Draw the play frame at the snap
-snapFrameId = playTracking.loc[playTracking['frameType'] == 'SNAP',]['frameId'].unique()[0]
-
-# Draw the frame
-drawFrame(snapFrameId, homeTeam, awayTeam, teamData,
-          playTracking, 'pos',
-          lineOfScrimmage = lineOfScrimmage,
-          firstDownMark = firstDownMark)
-
-# Animate play from line set to end
-# -------------------------------------------------------------------------
-
-# Create the field to plot on
-fieldFig, fieldAx = plt.subplots(figsize=(14, 6.5))
-createField(fieldFig, fieldAx,
-            lineOfScrimmage=lineOfScrimmage, firstDownMark=firstDownMark,
-            homeTeamAbbr=homeTeam, awayTeamAbbr=awayTeam, teamData=teamData)
-
-# Identify the frame range from play
-lineSetFrameId = playTracking.loc[playTracking['event'] == 'line_set',]['frameId'].unique()[0]
-endFrameId = playTracking['frameId'].unique().max()
-
-# # Set route runner Id (Kelce)
-# routeRunnerId = 40011
-
-# Run animation function
-anim = animation.FuncAnimation(fieldFig, drawFrame,
-                               frames=range(lineSetFrameId, endFrameId + 1), repeat=False,
-                               fargs=(homeTeam, awayTeam, teamData, playTracking, 'pos',
-                                      None, None, None, #routeRunnerId,
-                                      None, lineOfScrimmage, firstDownMark))
-
-# Write to GIF file
-gifWriter = animation.PillowWriter(fps=60)
-anim.save(os.path.join('..', 'outputs', 'gif', f'samplePlay_DiggsMotion_game-{gameId}_play-{playId}.gif'),
-          dpi=150, writer=gifWriter)
-
-# Close figure after pause to avoid error
-plt.pause(1)
-plt.close()
+    # Sort by overall IMI
+    playerImiData.sort_values(by='IMI', ascending=False, inplace=True)
 
 # =========================================================================
-# Explore targeting rate in motion vs. stationary routes for a player
+# Create IMI polar plots
 # =========================================================================
 
-# TODO: up to here...
+# Check for creating visuals
+if createVisuals:
 
+    # Create individualised plots for players
+    # -------------------------------------------------------------------------
 
+    # Set the number of variables
+    imiPlotVars = ['targeted', 'reception', 'yards', 'yac', 'peakSeparation', 'separationAtCatch', 'releaseSpeed']
+    nPlotVars = len(imiPlotVars)
 
+    # Set theta values for spider plot
+    theta = radar_factory(nPlotVars, frame = 'polygon') * -1
 
+    # Identify contribution from components to players IMI
+    varContribution = {var: weightsIMI[var] / np.sum([weightsIMI[jj] for jj in imiPlotVars]) for var in imiPlotVars}
+    for var in imiPlotVars:
+        playerImiData[f'{var}IMI_contribution'] = [playerImiData[f'{var}IMI'].iloc[ii] * varContribution[var] for ii in range(len(playerImiData))]
 
+    # Identify max and minimum weighted contributions
+    maxC = np.max([playerImiData[f'{var}IMI_contribution'].max() for var in imiPlotVars])
+    minC = np.min([playerImiData[f'{var}IMI_contribution'].min() for var in imiPlotVars])
 
+    # Loop through eligible players
+    print('Creating player IMI figures...')
+    for nflId in tqdm(eligibleIMI):
 
+        # Settings
+        # -------------------------------------------------------------------------
 
+        # Read in players IMI results
+        with open(os.path.join('..', 'outputs', 'player', f'{nflId}_IMI.pkl'), 'rb') as pklFile:
+            imiResults = pickle.load(pklFile)
 
+        # Create the figure
+        fig = plt.figure(figsize=(14, 7))
 
+        # Set figure face colour transparency
+        fig.patch.set_facecolor('white')
+        fig.patch.set_alpha(0.0)
 
+        # Set subplot spacing
+        plt.subplots_adjust(left=0.02, right=0.98, bottom=0.16, top=0.95, wspace=0.05)
 
+        # Get player details
+        playerName = routeData.loc[routeData['nflId'] == nflId]['playerName'].values[0]
+        playerNo = '#' + str(int(rosterData.loc[rosterData['gsis_it_id'] == str(nflId), ['jersey_number']].values[0][0]))
+        playerPos = rosterData.loc[rosterData['gsis_it_id'] == str(nflId), ['position']].values[0][0]
+        playerTeam = routeData.loc[routeData['nflId'] == nflId]['teamName'].values[0]
+        playerTeamFull = teamData.loc[teamData['team_abbr'] == routeData.loc[routeData['nflId'] == nflId]['teamName'].values[0]]['team_name'].values[0]
 
+        # Get the plot colour for the player
+        teamCol = teamData.loc[teamData['team_abbr'] == playerTeam,]['team_color'].values[0]
+        teamCol2 = teamData.loc[teamData['team_abbr'] == playerTeam,]['team_color2'].values[0]
 
-# %% ---------- end of headStartIndex.py ---------- %% #
+        # Add the player image
+        # -------------------------------------------------------------------------
+
+        # Add the axis
+        imgAx = fig.add_subplot(1,2,1)
+
+        # Set axis values for ease and consistency
+        imgAx.set_xlim([0,1])
+        imgAx.set_ylim([0, 1])
+
+        # Load player image
+        playerImg = plt.imread(os.path.join('..', 'img', 'player', f'{nflId}.png'))
+
+        # Create the offset image
+        offsetImg = OffsetImage(playerImg, zoom=0.35)
+        offsetImg.image.axes = imgAx
+
+        # Create the annotation box
+        aBox = AnnotationBbox(offsetImg, [0.54,0.0],
+                              box_alignment = (0.5, 0.0),
+                              bboxprops={'lw': 0, 'fc': 'none', 'zorder': 1, 'clip_on': False}
+                              )
+
+        # Add the image
+        imgAx.add_artist(aBox)
+
+        # Turn the axis off
+        imgAx.axis('off')
+
+        # Add the polar plot
+        # -------------------------------------------------------------------------
+
+        # Add the axis and set the projection
+        plotAx = fig.add_subplot(1,2,2,projection = 'radar')
+
+        # Get the players data
+        imiPlayer = playerImiData.loc[playerImiData['nflId'] == nflId,]
+        playerC = [imiPlayer.iloc[0][f'{var}IMI_contribution'] for var in imiPlotVars]
+
+        # Use max and min values to set limits
+        plotAx.set_ylim([minC, maxC + 0.10])
+
+        # Add label for each multiplier component
+        plotAx.text(theta[0], maxC + 0.05, 'Targets', rotation=90,
+                    color=teamCol, font='Arial', fontweight='bold', fontsize=10,
+                    ha='center', va='top', zorder = 4)
+        plotAx.text(theta[1], maxC + 0.05, 'Rec.', rotation=90-np.rad2deg(theta[1]*-1),
+                    color=teamCol, font='Arial', fontweight='bold', fontsize=10,
+                    ha='right', va='top', zorder = 4)
+        plotAx.text(theta[2], maxC + 0.05, 'Yards', rotation=90 - np.rad2deg(theta[2] * -1),
+                    color=teamCol, font='Arial', fontweight='bold', fontsize=10,
+                    ha='right', va='center', zorder = 4)
+        plotAx.text(theta[3], maxC + 0.05, 'YAC', rotation=90 - np.rad2deg(theta[3] * -1),
+                    color=teamCol, font='Arial', fontweight='bold', fontsize=10,
+                    ha='right', va='bottom', zorder = 4)
+        plotAx.text(theta[4], maxC + 0.05, 'Peak Sep.', rotation=-90 - np.rad2deg(theta[4] * -1),
+                    color=teamCol, font='Arial', fontweight='bold', fontsize=10,
+                    ha='left', va='bottom', zorder = 4)
+        plotAx.text(theta[5], maxC + 0.05, 'Sep. at Catch', rotation=-90 - np.rad2deg(theta[5] * -1),
+                    color=teamCol, font='Arial', fontweight='bold', fontsize=10,
+                    ha='left', va='bottom', zorder = 4)
+        plotAx.text(theta[6], maxC + 0.05, 'Rel. Speed', rotation=-90 - np.rad2deg(theta[6] * -1),
+                    color=teamCol, font='Arial', fontweight='bold', fontsize=10,
+                    ha='left', va='top', zorder = 4)
+
+        # Turn off grids and ticks
+        # plotAx.set_ylim([0, 0.75])
+        plotAx.grid(axis='y', linestyle=':', linewidth=0.0, color='dimgrey', alpha=0.0)
+        plotAx.set_yticklabels([])
+
+        # Remove spoke grid lines
+        plotAx.set_xticklabels([])
+        plotAx.grid(axis='x', linestyle=':', linewidth=0.0, color='dimgrey', alpha=0.0)
+
+        # Set polar spine borders to team colour
+        plotAx.spines['polar'].set(color=teamCol, lw=2.5)
+
+        # Set axes background colour
+        plotAx.set_facecolor('white')
+
+        # Add a line that would represent a weighted IMI of 1
+        imiOneLine = plotAx.plot(theta, [varContribution[var] for var in imiPlotVars],
+                                 lw=1.0, ls=':', c='dimgrey', alpha=1.0,
+                                 zorder=1, clip_on=False)
+
+        # Plot mean IMI data and fill
+        imiLine = plotAx.plot(theta, playerC,
+                              lw = 2.0, ls = '-', c = teamCol2,
+                              zorder = 3, clip_on = False)
+        imiFill = plotAx.fill(theta, playerC,
+                              facecolor = teamCol2, alpha = 0.30,
+                              zorder = 2, clip_on = False,
+                              label = '_nolegend')
+
+        # Increase size of polar axis for viewability
+        axPos = plotAx.get_position()
+        plotAx.set_position((axPos.x0, axPos.y0, (axPos.x1-axPos.x0)*1.04, (axPos.y1-axPos.y0)*1.04))
+
+        # Add the annotations
+        # -------------------------------------------------------------------------
+
+        # Add the line underneath axes
+        # Get the bottom left of the player image axis in the figure coordinates
+        imgAxPos = (imgAx.get_position().x0, imgAx.get_position().y0)
+        # Get position opposite to this representing the other axis border
+        endLinePos = (1 - imgAxPos[0], imgAxPos[1])
+        # Transform the figure coordinate to display and then into the data coordinates
+        endLinePosData = imgAx.transData.inverted().transform(fig.transFigure.transform(endLinePos))
+        # Draw line on image axis by transforming position
+        imgAx.plot([0.0, endLinePosData[0]], [0.0, 0.0],
+                   ls='-', lw=2.5, c=teamCol, zorder=4, clip_on=False)
+
+        # Read in and display team logo
+        teamImg = plt.imread(os.path.join('..', 'img', 'team', f'{playerTeam}.png'))
+        offsetImg = OffsetImage(teamImg, zoom=0.095)
+        offsetImg.image.axes = imgAx
+        aBox = AnnotationBbox(offsetImg, [0.0,0.0],
+                              box_alignment = (0.0, 1.0),
+                              bboxprops={'lw': 0, 'fc': 'none', 'zorder': 1, 'clip_on': False}
+                              )
+        imgAx.add_artist(aBox)
+
+        # Add the player name
+        imgAx.text(0.14, -0.02, playerName,
+                   color = teamCol, font ='Quakerhack', fontsize = 44,
+                   ha = 'left', va = 'top', clip_on = False)
+
+        # Add player details
+        imgAx.text(0.14, -0.16, f'{playerNo}, {playerPos}, {playerTeamFull}',
+                   color = teamCol, font = 'Arial', fontweight = 'normal', fontsize=12,
+                   ha = 'left', va = 'top', clip_on = False)
+
+        # Add the players overall IMI
+        imiVal = playerImiData.loc[playerImiData['nflId'] == nflId,]['IMI'].values[0]
+        imgAx.text(endLinePosData[0], -0.02, f'IMI: {"{0:.3f}".format(np.round(imiVal,3))}',
+                   color=teamCol2, font='Kuunari', fontsize = 44,
+                   ha='right', va='top', clip_on=False)
+
+        # Add the confidence intervals around the IMI
+        lb95 = imiResults['IMI']['sampleVals'].mean() - (1.96 * (imiResults['IMI']['sampleVals'].std() / np.sqrt(len(imiResults['IMI']['sampleVals']))))
+        ub95 = imiResults['IMI']['sampleVals'].mean() + (1.96 * (imiResults['IMI']['sampleVals'].std() / np.sqrt(len(imiResults['IMI']['sampleVals']))))
+        imgAx.text(endLinePosData[0], -0.12, f'[{"{0:.3f}".format(np.round(lb95,3))}, {"{0:.3f}".format(np.round(ub95,3))} 95% CIs]',
+                   color=teamCol2, font='Arial', fontweight='normal', fontsize=12,
+                   ha='right', va='top', clip_on=False)
+
+        # Save player figure
+        # -------------------------------------------------------------------------
+
+        # Save figure
+        fig.savefig(os.path.join('..', 'outputs', 'figure', 'player', f'{nflId}_imiSummary.png'),
+                    format='png', dpi=600,
+                    # transparent=True
+                    facecolor = fig.get_facecolor(), edgecolor='none'
+                    )
+
+        # Close figure
+        plt.close('all')
+
+    # Create overall IMI plot for all players
+    # -------------------------------------------------------------------------
+
+    # Create the figure
+    fig = plt.figure(figsize=(10, 28))
+
+    # Set figure face colour transparency
+    fig.patch.set_facecolor('white')
+    fig.patch.set_alpha(0.0)
+
+    # Set subplots position and spacing
+    plt.subplots_adjust(left=0.02, right=0.98, bottom=0.05, top=0.925, wspace=0.20, hspace=0.55)
+
+    # Add figure title
+    fig.text(0.01, 0.97,
+             'In Motion Index (IMI) of Eligible Players',
+             font='Kuunari', fontsize=24,
+             ha='left', va='center')
+
+    # Add descriptive text
+    fig.text(0.01, 0.945,
+             'Players ordered according to overall IMI. Players required a minimum of 100 routes run in the Big Data Bowl 2025 dataset to be eligible.',
+             font='Arial', fontsize=8, fontweight='normal',
+             ha='left', va='center', fontstyle='italic')
+
+    # Loop through player rankings to plot their data
+    for ii in range(len(playerImiData)):
+
+        # Get the player Id
+        nflId = playerImiData.iloc[ii]['nflId']
+
+        # Read in players IMI results
+        with open(os.path.join('..', 'outputs', 'player', f'{nflId}_IMI.pkl'), 'rb') as pklFile:
+            imiResults = pickle.load(pklFile)
+
+        # Get player details
+        playerName = routeData.loc[routeData['nflId'] == nflId]['playerName'].values[0]
+        playerNo = '#' + str(int(rosterData.loc[rosterData['gsis_it_id'] == str(nflId), ['jersey_number']].values[0][0]))
+        playerPos = rosterData.loc[rosterData['gsis_it_id'] == str(nflId), ['position']].values[0][0]
+        playerTeam = routeData.loc[routeData['nflId'] == nflId]['teamName'].values[0]
+        playerTeamFull = teamData.loc[teamData['team_abbr'] == routeData.loc[routeData['nflId'] == nflId]['teamName'].values[0]]['team_name'].values[0]
+
+        # Get the plot colour for the player
+        teamCol = teamData.loc[teamData['team_abbr'] == playerTeam,]['team_color'].values[0]
+        teamCol2 = teamData.loc[teamData['team_abbr'] == playerTeam,]['team_color2'].values[0]
+
+        # Add the player image
+        # -------------------------------------------------------------------------
+
+        # Add the axis
+        if ii < 50:
+            imgAx = fig.add_subplot(11, 10, int(np.linspace(1,199,100)[ii]))
+        else:
+            imgAx = fig.add_subplot(11, 10, int(np.linspace(1, 199, 100)[ii])+2)
+
+        # Set axis values for ease and consistency
+        imgAx.set_xlim([0, 1])
+        imgAx.set_ylim([0, 1])
+
+        # Load player image
+        playerImg = plt.imread(os.path.join('..', 'img', 'player', f'{nflId}.png'))
+
+        # Create the offset image
+        offsetImg = OffsetImage(playerImg, zoom=0.035)
+        offsetImg.image.axes = imgAx
+
+        # Create the annotation box
+        aBox = AnnotationBbox(offsetImg, [0.54, 0.0],
+                              box_alignment=(0.5, 0.0),
+                              bboxprops={'lw': 0, 'fc': 'none', 'zorder': 1, 'clip_on': False}
+                              )
+
+        # Add the image
+        imgAx.add_artist(aBox)
+
+        # Turn the axis off
+        imgAx.axis('off')
+
+        # Add the polar plot
+        # -------------------------------------------------------------------------
+
+        # Add the axis and set the projection
+        if ii < 50:
+            plotAx = fig.add_subplot(11, 10, int(np.linspace(2,200,100)[ii]), projection='radar')
+        else:
+            plotAx = fig.add_subplot(11, 10, int(np.linspace(2, 200, 100)[ii])+2, projection='radar')
+
+        # Get the players data
+        imiPlayer = playerImiData.loc[playerImiData['nflId'] == nflId,]
+        playerC = [imiPlayer.iloc[0][f'{var}IMI_contribution'] for var in imiPlotVars]
+
+        # Use max and min values to set limits
+        plotAx.set_ylim([minC, maxC + 0.10])
+
+        # Add label for each multiplier component
+        plotAx.text(theta[0], maxC - 0.05, 'T',
+                    color=teamCol, font='Arial', fontweight='bold', fontsize=2,
+                    ha='center', va='center', zorder=4)
+        plotAx.text(theta[1], maxC - 0.05, 'R',
+                    color=teamCol, font='Arial', fontweight='bold', fontsize=2,
+                    ha='center', va='center', zorder=4)
+        plotAx.text(theta[2], maxC - 0.05, 'Y',
+                    color=teamCol, font='Arial', fontweight='bold', fontsize=2,
+                    ha='center', va='center', zorder=4)
+        plotAx.text(theta[3], maxC - 0.05, 'YAC',
+                    color=teamCol, font='Arial', fontweight='bold', fontsize=2,
+                    ha='center', va='center', zorder=4)
+        plotAx.text(theta[4], maxC - 0.05, 'PS',
+                    color=teamCol, font='Arial', fontweight='bold', fontsize=2,
+                    ha='center', va='center', zorder=4)
+        plotAx.text(theta[5], maxC - 0.05, 'SC',
+                    color=teamCol, font='Arial', fontweight='bold', fontsize=2,
+                    ha='center', va='center', zorder=4)
+        plotAx.text(theta[6], maxC - 0.05, 'RS',
+                    color=teamCol, font='Arial', fontweight='bold', fontsize=2,
+                    ha='center', va='center', zorder=4)
+
+        # Turn off grids and ticks
+        # plotAx.set_ylim([0, 0.75])
+        plotAx.grid(axis='y', linestyle=':', linewidth=0.0, color='dimgrey', alpha=0.0)
+        plotAx.set_yticklabels([])
+
+        # Remove spoke grid lines
+        plotAx.set_xticklabels([])
+        plotAx.grid(axis='x', linestyle=':', linewidth=0.0, color='dimgrey', alpha=0.0)
+
+        # Set polar spine borders to team colour
+        plotAx.spines['polar'].set(color=teamCol, lw=0.75)
+
+        # Set axes background colour
+        plotAx.set_facecolor('white')
+
+        # Add a line that would represent a weighted IMI of 1
+        imiOneLine = plotAx.plot(theta, [varContribution[var] for var in imiPlotVars],
+                                 lw=0.25, ls=':', c='dimgrey', alpha=1.0,
+                                 zorder=1, clip_on=False)
+
+        # Plot mean IMI data and fill
+        imiLine = plotAx.plot(theta, playerC,
+                              lw=0.75, ls='-', c=teamCol2,
+                              zorder=3, clip_on=False)
+        imiFill = plotAx.fill(theta, playerC,
+                              facecolor=teamCol2, alpha=0.30,
+                              zorder=2, clip_on=False,
+                              label='_nolegend')
+
+        # Alter polar axis position for viewability
+        axPos = plotAx.get_position()
+        plotAx.set_position((axPos.x0, axPos.y0 + 0.0025, (axPos.x1 - axPos.x0), (axPos.y1 - axPos.y0)))
+
+        # Add the annotations
+        # -------------------------------------------------------------------------
+
+        # Add the line underneath axes
+        # Get the bottom left of the player image axis in the figure coordinates
+        imgAxPos = imgAx.get_position()
+        plotAxPos = plotAx.get_position()
+        # Get position opposite to this representing the other axis border
+        endLinePos = (plotAxPos.x1, plotAxPos.y0)
+        # Transform the figure coordinate to display and then into the data coordinates
+        endLinePosData = imgAx.transData.inverted().transform(fig.transFigure.transform(endLinePos))
+        # Draw line on image axis by transforming position
+        imgAx.plot([0.0, endLinePosData[0]], [0.0, 0.0],
+                   ls='-', lw=0.75, c=teamCol, zorder=4, clip_on=False)
+
+        # Add the player name
+        imgAx.text(0.0, -0.03, playerName,
+                   color=teamCol, font='Quakerhack', fontsize=8,
+                   ha='left', va='top', clip_on=False)
+
+        # Add player details
+        imgAx.text(0.0, -0.26, f'{playerNo}, {playerPos}, {playerTeamFull}',
+                   color=teamCol, font='Arial', fontweight='normal', fontsize=4,
+                   ha='left', va='top', clip_on=False)
+
+        # Add the players overall IMI
+        imiVal = playerImiData.loc[playerImiData['nflId'] == nflId,]['IMI'].values[0]
+        imgAx.text(endLinePosData[0], -0.03, f'IMI: {"{0:.3f}".format(np.round(imiVal, 3))}',
+                   color=teamCol2, font='Kuunari', fontsize=8,
+                   ha='right', va='top', clip_on=False)
+
+        # Add the confidence intervals around the IMI
+        lb95 = imiResults['IMI']['sampleVals'].mean() - (
+                    1.96 * (imiResults['IMI']['sampleVals'].std() / np.sqrt(len(imiResults['IMI']['sampleVals']))))
+        ub95 = imiResults['IMI']['sampleVals'].mean() + (
+                    1.96 * (imiResults['IMI']['sampleVals'].std() / np.sqrt(len(imiResults['IMI']['sampleVals']))))
+        imgAx.text(endLinePosData[0], -0.26, f'[{"{0:.3f}".format(np.round(lb95, 3))}, {"{0:.3f}".format(np.round(ub95, 3))} 95% CIs]',
+                   color=teamCol2, font='Arial', fontweight='normal', fontsize=4,
+                   ha='right', va='top', clip_on=False)
+
+    # Save group figure
+    # -------------------------------------------------------------------------
+
+    # Save figure
+    fig.savefig(os.path.join('..', 'outputs', 'figure', f'allPlayers_imiSummary.png'),
+                format='png', dpi=600,
+                # transparent=True
+                facecolor=fig.get_facecolor(), edgecolor='none'
+                )
+
+    # Close figure
+    plt.close('all')
+
+# =========================================================================
+# Create leaderboards for individual multiplier components
+# =========================================================================
+
+# Check for creating visuals
+if createVisuals:
+
+    # Create the multiplier leaderboards for each variable
+    # -------------------------------------------------------------------------
+
+    # Set the variables to create leaderboards for
+    leaderboardVars = ['targeted', 'reception', 'yards', 'yac', 'peakSeparation', 'separationAtCatch', 'releaseSpeed']
+    leaderboardVars_label = ['Targets', 'Receptions', 'Yards', 'YAC', 'Peak Separation', 'Separation at Catch', 'Release Speed']
+
+    # Loop through variables
+    print('Creating visuals for IMI multiplier leaderboards...')
+    for var in tqdm(leaderboardVars):
+
+        # Create a copy and sort by the current multiplier
+        leaderboardData = playerImiData.copy()
+        leaderboardData.sort_values(by = f'{var}IMI', ascending = False, inplace = True)
+
+        # Create the
+        fig, ax = plt.subplots(nrows = 1, ncols = 1, figsize = (6,7))
+
+        # Set subplot spacing
+        plt.subplots_adjust(left = 0.125, right = 0.975, bottom = 0.075, top = 0.9)
+
+        # Add figure title
+        fig.text(0.01, 0.97,
+                 f'Top 5 Players for {leaderboardVars_label[leaderboardVars.index(var)]} IMI Multiplier',
+                 font = 'Kuunari', fontsize = 24,
+                 ha = 'left', va = 'center')
+
+        # Add descriptive text
+        fig.text(0.01, 0.94,
+                 'Data represents the average estimate \u00b1 95% confidence intervals for multiplier',
+                 font='Arial', fontsize=8, fontweight='normal',
+                 ha='left', va='center', fontstyle='italic')
+
+        # Set the y limits for the top 5
+        ax.set_ylim([0.5, 5.5])
+
+        # Invert y-axis so #1 is at the top
+        ax.yaxis.set_inverted(True)
+
+        # Add player data
+        # -------------------------------------------------------------------------
+        for ii in range(5):
+
+            # Get the players Id
+            nflId = leaderboardData.iloc[ii]['nflId']
+
+            # Read in players IMI results
+            with open(os.path.join('..', 'outputs', 'player', f'{nflId}_IMI.pkl'), 'rb') as pklFile:
+                imiResults = pickle.load(pklFile)
+
+            # Get colouring details
+            playerTeam = routeData.loc[routeData['nflId'] == nflId]['teamName'].values[0]
+            teamCol = teamData.loc[teamData['team_abbr'] == playerTeam,]['team_color'].values[0]
+            teamCol2 = teamData.loc[teamData['team_abbr'] == playerTeam,]['team_color2'].values[0]
+
+            # Add point at mean
+            ax.scatter(imiResults[var]['mean'], ii + 1 + 0.15,
+                       s=75, marker='o', fc=teamCol, ec=teamCol2,
+                       zorder=3)
+
+            # Add the confidence intervals
+            ax.plot([imiResults[var]['lowerBound'], imiResults[var]['upperBound']], [ii + 1 + 0.15, ii + 1 + 0.15],
+                    c=teamCol2, lw=1.5, ls='-',
+                    zorder=2)
+
+        # Clean up axes
+        # -------------------------------------------------------------------------
+
+        # Reset x-axis to zero lower limit
+        ax.set_xlim([0, ax.get_xlim()[1]])
+
+        # Add x-axis label
+        ax.set_xlabel('IMI Multiplier', fontsize = 12, fontweight = 'bold', labelpad = 7.5)
+
+        # Set x-axis ticks to whole numbers
+        if ax.get_xlim()[1] <= 12:
+            ax.set_xticks(np.arange(0,np.round(ax.get_xlim()[1])+1))
+        else:
+            ax.set_xticks(np.arange(0, np.round(ax.get_xlim()[1]) + 1, 2))
+
+        # Remove y-tick labels and ticks
+        ax.set_yticklabels([])
+        ax.tick_params(axis = 'y', length = 0)
+
+        # Edit x-tick parameters for top and bottom
+        ax.tick_params(axis = 'x', top = True, labeltop = True, direction = 'in')
+
+        # Remove the undesired spines
+        ax.spines['left'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+        # Add player details
+        # -------------------------------------------------------------------------
+
+        # Re-loop through players
+        for ii in range(5):
+
+            # Get the players Id
+            nflId = leaderboardData.iloc[ii]['nflId']
+
+            # Get player details
+            playerName = routeData.loc[routeData['nflId'] == nflId]['playerName'].values[0]
+            playerNo = '#' + str(int(rosterData.loc[rosterData['gsis_it_id'] == str(nflId), ['jersey_number']].values[0][0]))
+            playerPos = rosterData.loc[rosterData['gsis_it_id'] == str(nflId), ['position']].values[0][0]
+            playerTeam = routeData.loc[routeData['nflId'] == nflId]['teamName'].values[0]
+            playerTeamFull = teamData.loc[teamData['team_abbr'] == routeData.loc[routeData['nflId'] == nflId]['teamName'].values[0]]['team_name'].values[0]
+
+            # Get the plot colour for the player
+            teamCol = teamData.loc[teamData['team_abbr'] == playerTeam,]['team_color'].values[0]
+            teamCol2 = teamData.loc[teamData['team_abbr'] == playerTeam,]['team_color2'].values[0]
+
+            # Add image
+            # -------------------------------------------------------------------------
+
+            # Load player image
+            playerImg = plt.imread(os.path.join('..', 'img', 'player', f'{nflId}_cropped_col0.png'))
+            # Create the offset image
+            offsetImg = OffsetImage(playerImg, zoom=0.04)
+            offsetImg.image.axes = ax
+            # Create the annotation box
+            aBox = AnnotationBbox(offsetImg, [0.0, ii+1],
+                                  box_alignment=(1.0, 0.5),
+                                  bboxprops={'lw': 0, 'fc': 'none', 'clip_on': False}
+                                  )
+            # Add the image
+            ax.add_artist(aBox)
+
+            # Add player text
+            # -------------------------------------------------------------------------
+
+            # Add player name
+            nameText = ax.text(0, ii+1 - 0.03, playerName,
+                               color = teamCol,
+                               font='Quakerhack', fontsize=16,
+                               ha='left', va='bottom', clip_on=False)
+
+            # Add player details
+            detailText = ax.text(0, ii+1,
+                                 f'{playerNo}, {playerPos}, {playerTeam}',
+                                 color = teamCol,
+                                 font='Arial', fontsize=8, fontweight='normal',
+                                 ha='left', va='top', clip_on=False)
+
+        # Save to file
+        # -------------------------------------------------------------------------
+
+        # Save figure
+        fig.savefig(os.path.join('..', 'outputs', 'figure', f'topPlayers_{var}.png'),
+                    format='png', dpi=600, transparent=True)
+
+        # Close figure
+        plt.close('all')
+
+# =========================================================================
+# Create quadrant plot for in motion routes vs. IMI
+# =========================================================================
+
+# Check for creating visuals
+if createVisuals:
+
+    # Create plot of in motion usage vs. IMI
+    # -------------------------------------------------------------------------
+
+    # Calculate z-score for in motion route proportion across players
+    playerImiData['inMotionRouteProp'] = playerImiData['nInMotionRoutes'] / (playerImiData['nInMotionRoutes'] + playerImiData['nStationaryRoutes'])
+    playerImiData['inMotionRoutePropZ'] = (playerImiData['inMotionRouteProp'] - playerImiData['inMotionRouteProp'].mean()) / playerImiData['inMotionRouteProp'].std()
+
+    # Create figure to plot on
+    fig, ax = plt.subplots(nrows = 1, ncols = 1, figsize = (9,8))
+    plt.subplots_adjust(left = 0.04, right = 0.96, bottom = 0.05, top = 0.91)
+
+    # Add figure title
+    fig.text(0.01, 0.97,
+             'Player In Motion Route Efficiency: Usage vs. IMI',
+             font='Kuunari', fontsize=24,
+             ha='left', va='center')
+
+    # Add descriptive text
+    fig.text(0.01, 0.94,
+             'In motion route usage calculated as a proportion relative to other eligible players and referenced against the player''s IMI',
+             font='Arial', fontsize=8, fontweight='normal',
+             ha='left', va='center', fontstyle='italic')
+
+    # Create scatter plot using team colours
+    # -------------------------------------------------------------------------
+
+    # Loop through dataset
+    for ii in range(len(playerImiData)):
+
+        # Get player data
+        inMotionRoutePropZ = playerImiData.iloc[ii]['inMotionRoutePropZ']
+        imi = playerImiData.iloc[ii]['IMI']
+
+        # Get player details
+        nflId = playerImiData.iloc[ii]['nflId']
+        playerName = routeData.loc[routeData['nflId'] == nflId]['playerName'].values[0]
+        playerNo = '#' + str(int(rosterData.loc[rosterData['gsis_it_id'] == str(nflId), ['jersey_number']].values[0][0]))
+        playerPos = rosterData.loc[rosterData['gsis_it_id'] == str(nflId), ['position']].values[0][0]
+        playerTeam = routeData.loc[routeData['nflId'] == nflId]['teamName'].values[0]
+        playerTeamFull = teamData.loc[teamData['team_abbr'] == routeData.loc[routeData['nflId'] == nflId]['teamName'].values[0]]['team_name'].values[0]
+
+        # Get colouring details
+        teamCol = teamData.loc[teamData['team_abbr'] == playerTeam,]['team_color'].values[0]
+        teamCol2 = teamData.loc[teamData['team_abbr'] == playerTeam,]['team_color2'].values[0]
+
+        # Add the data point
+        ax.scatter(inMotionRoutePropZ, imi,
+                   s = 25, marker = 'o', c = teamCol, ec = teamCol2,
+                   zorder = 3, clip_on = False)
+
+    # Set even x-axis
+    if np.abs(ax.get_xlim()[1]) > np.abs(ax.get_xlim()[0]):
+        ax.set_xlim([ax.get_xlim()[1]*-1, ax.get_xlim()[1]])
+    else:
+        ax.set_xlim([ax.get_xlim()[0], ax.get_xlim()[0]*-1])
+
+    # Set even y-axis
+    ax.set_ylim([1 - (ax.get_ylim()[1] - 1), ax.get_ylim()[1]])
+
+    # Add quadrant lines
+    # X-axis
+    ax.plot([ax.get_xlim()[0], ax.get_xlim()[1]], [1.0, 1.0], c = 'black', lw = 2.5, zorder = 2)
+    ax.scatter(ax.get_xlim()[0], 1.0, s = 75, c = 'black', marker = '<', clip_on = False, zorder = 2)
+    ax.scatter(ax.get_xlim()[1], 1.0, s = 75, c = 'black', marker = '>', clip_on = False, zorder = 2)
+    # Y-axis
+    ax.plot([0.0, 0.0], [ax.get_ylim()[0], ax.get_ylim()[1]], c = 'black', lw = 2.5, zorder = 2)
+    ax.scatter(0.0, ax.get_ylim()[1], s = 75, c = 'black', marker = '^', clip_on = False, zorder = 2)
+    ax.scatter(0.0, ax.get_ylim()[0], s = 75, c = 'black', marker = 'v', clip_on = False, zorder = 2)
+
+    # Turn axis off
+    ax.axis('off')
+
+    # Add axis labelling
+    # -------------------------------------------------------------------------
+
+    # Add x-axis text
+    ax.text(ax.get_xlim()[0] + 0.1, 1 - 0.03, 'Lower In Motion Route Usage',
+            ha = 'left', va = 'top',
+            font = 'Arial', fontsize = 10, fontweight = 'normal', fontstyle = 'italic',
+            zorder = 2)
+    ax.text(ax.get_xlim()[1] - 0.1, 1 + 0.03, 'Higher In Motion Route Usage',
+            ha='right', va='bottom',
+            font='Arial', fontsize=10, fontweight='normal', fontstyle='italic',
+            zorder=2)
+
+    # Add y-axis text
+    ax.text(0 + 0.075, ax.get_ylim()[1] - 0.04, 'Higher IMI (> 1)',
+            ha='left', va='top', rotation = 90,
+            font='Arial', fontsize=10, fontweight='normal', fontstyle='italic',
+            zorder=2)
+    ax.text(0 - 0.075, ax.get_ylim()[0] + 0.04, 'Lower IMI (< 1)',
+            ha='right', va='bottom', rotation=90,
+            font='Arial', fontsize=10, fontweight='normal', fontstyle='italic',
+            zorder=2)
+
+    # Save to file
+    # -------------------------------------------------------------------------
+
+    # Save figure
+    fig.savefig(os.path.join('..', 'outputs', 'figure', f'inMotionUsage_v_IMI.png'),
+                format='png', dpi=600, transparent=True)
+
+    # Close figure
+    plt.close('all')
+
+    # Quickly repeat above plot with player labels for reference (simplified)
+    # -------------------------------------------------------------------------
+
+    # Create figure to plot on
+    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(9, 8))
+    plt.subplots_adjust(left=0.04, right=0.96, bottom=0.05, top=0.91)
+
+    # Create scatter plot using team colours
+    # -------------------------------------------------------------------------
+
+    # Loop through dataset
+    for ii in range(len(playerImiData)):
+        # Get player data
+        inMotionRoutePropZ = playerImiData.iloc[ii]['inMotionRoutePropZ']
+        imi = playerImiData.iloc[ii]['IMI']
+
+        # Get player details
+        nflId = playerImiData.iloc[ii]['nflId']
+        playerName = routeData.loc[routeData['nflId'] == nflId]['playerName'].values[0]
+        playerNo = '#' + str(int(rosterData.loc[rosterData['gsis_it_id'] == str(nflId), ['jersey_number']].values[0][0]))
+        playerPos = rosterData.loc[rosterData['gsis_it_id'] == str(nflId), ['position']].values[0][0]
+        playerTeam = routeData.loc[routeData['nflId'] == nflId]['teamName'].values[0]
+        playerTeamFull = teamData.loc[teamData['team_abbr'] == routeData.loc[routeData['nflId'] == nflId]['teamName'].values[0]]['team_name'].values[
+            0]
+
+        # Get colouring details
+        teamCol = teamData.loc[teamData['team_abbr'] == playerTeam,]['team_color'].values[0]
+        teamCol2 = teamData.loc[teamData['team_abbr'] == playerTeam,]['team_color2'].values[0]
+
+        # Add the data point
+        ax.scatter(inMotionRoutePropZ, imi,
+                   s=25, marker='o', c=teamCol, ec=teamCol2,
+                   zorder=3, clip_on=False)
+
+    # Set even x-axis
+    if np.abs(ax.get_xlim()[1]) > np.abs(ax.get_xlim()[0]):
+        ax.set_xlim([ax.get_xlim()[1] * -1, ax.get_xlim()[1]])
+    else:
+        ax.set_xlim([ax.get_xlim()[0], ax.get_xlim()[0] * -1])
+
+    # Set even y-axis
+    ax.set_ylim([1 - (ax.get_ylim()[1] - 1), ax.get_ylim()[1]])
+
+    # Add quadrant lines
+    # X-axis
+    ax.plot([ax.get_xlim()[0], ax.get_xlim()[1]], [1.0, 1.0], c='black', lw=2.5, zorder=2)
+    ax.scatter(ax.get_xlim()[0], 1.0, s=75, c='black', marker='<', clip_on=False, zorder=2)
+    ax.scatter(ax.get_xlim()[1], 1.0, s=75, c='black', marker='>', clip_on=False, zorder=2)
+    # Y-axis
+    ax.plot([0.0, 0.0], [ax.get_ylim()[0], ax.get_ylim()[1]], c='black', lw=2.5, zorder=2)
+    ax.scatter(0.0, ax.get_ylim()[1], s=75, c='black', marker='^', clip_on=False, zorder=2)
+    ax.scatter(0.0, ax.get_ylim()[0], s=75, c='black', marker='v', clip_on=False, zorder=2)
+
+    # Turn axis off
+    ax.axis('off')
+
+    # Add point labels
+    # -------------------------------------------------------------------------
+
+    # Annotate all points
+    for ii, txt in enumerate(playerImiData['playerName'].to_list()):
+        ax.annotate(
+            txt, (playerImiData['inMotionRoutePropZ'].to_numpy()[ii],
+                  playerImiData['IMI'].to_numpy()[ii]),
+            font = 'Arial', fontsize = 8, fontweight = 'normal',
+        )
+
+    # Save to file
+    # -------------------------------------------------------------------------
+
+    # Save figure
+    fig.savefig(os.path.join('..', 'outputs', 'figure', f'inMotionUsage_v_IMI_playerReference.png'),
+                format='png', dpi=600, transparent=True)
+
+    # Close figure
+    plt.close('all')
+
+# =========================================================================
+# Option to visualise the motion in a motion route play
+# =========================================================================
+
+"""
+
+NOTE: Below is commented out but provides the option to use a function
+that can draw and animate plays.
+
+"""
+
+# # The sample play comes from Travis Kelce (40011)
+# nflId = 40011
+#
+# # Provide a game and play Id. This particular play is a motion route from Kelce
+# gameId = 2022091110
+# playId = 2720
+# weekNo = games.loc[games['gameId'] == gameId]['week'].values[0]
+#
+# # Get the tracking data for the play
+# playTracking = tracking[f'week{weekNo}'].loc[
+#     (tracking[f'week{weekNo}']['gameId'] == gameId) &
+#     (tracking[f'week{weekNo}']['playId'] == playId)]
+#
+# # Get the play description
+# playDesc = plays.loc[(plays['gameId'] == gameId) &
+#                      (plays['playId'] == playId)]
+#
+# # Get the line of scrimmage and down markers
+# lineOfScrimmage = playDesc['absoluteYardlineNumber'].to_numpy()[0]
+# if playTracking['playDirection'].unique()[0] == 'left':
+#     # Get the yards to go and invert for field direction
+#     firstDownMark = lineOfScrimmage - playDesc['yardsToGo'].to_numpy()[0]
+# else:
+#     # Use standard values for right directed play
+#     firstDownMark = lineOfScrimmage + playDesc['yardsToGo'].to_numpy()[0]
+#
+# # Get home and away teams for game
+# homeTeam = games.loc[games['gameId'] == gameId,]['homeTeamAbbr'].values[0]
+# awayTeam = games.loc[games['gameId'] == gameId,]['visitorTeamAbbr'].values[0]
+#
+# # Visualise the play at the snap
+# # -------------------------------------------------------------------------
+#
+# # Create the field to plot on
+# fieldFig, fieldAx = plt.subplots(figsize=(14, 6.5))
+# createField(fieldFig, fieldAx,
+#             lineOfScrimmage = lineOfScrimmage, firstDownMark = firstDownMark,
+#             homeTeamAbbr = homeTeam, awayTeamAbbr = awayTeam, teamData = teamData)
+#
+# # Draw the play frame at the snap
+# snapFrameId = playTracking.loc[playTracking['frameType'] == 'SNAP',]['frameId'].unique()[0]
+#
+# # Draw the frame
+# drawFrame(snapFrameId, homeTeam, awayTeam, teamData,
+#           playTracking, 'pos',
+#           lineOfScrimmage = lineOfScrimmage,
+#           firstDownMark = firstDownMark)
+#
+# # Animate play from line set to end
+# # -------------------------------------------------------------------------
+#
+# # Create the field to plot on
+# fieldFig, fieldAx = plt.subplots(figsize=(14, 6.5))
+# createField(fieldFig, fieldAx,
+#             lineOfScrimmage=lineOfScrimmage, firstDownMark=firstDownMark,
+#             homeTeamAbbr=homeTeam, awayTeamAbbr=awayTeam, teamData=teamData)
+#
+# # Identify the frame range from play
+# lineSetFrameId = playTracking.loc[playTracking['event'] == 'line_set',]['frameId'].unique()[0]
+# endFrameId = playTracking['frameId'].unique().max()
+#
+# # # Set route runner Id (Kelce)
+# # routeRunnerId = 40011
+#
+# # Run animation function
+# anim = animation.FuncAnimation(fieldFig, drawFrame,
+#                                frames=range(lineSetFrameId, endFrameId + 1), repeat=False,
+#                                fargs=(homeTeam, awayTeam, teamData, playTracking, 'pos',
+#                                       None, None, None, #routeRunnerId,
+#                                       None, lineOfScrimmage, firstDownMark))
+#
+# # Write to GIF file
+# gifWriter = animation.PillowWriter(fps=60)
+# anim.save(os.path.join('..', 'outputs', 'gif', f'samplePlay_DiggsMotion_game-{gameId}_play-{playId}.gif'),
+#           dpi=150, writer=gifWriter)
+#
+# # Close figure after pause to avoid error
+# plt.pause(1)
+# plt.close()
+
+# %% ---------- end of InMotionIndex.py ---------- %% #
